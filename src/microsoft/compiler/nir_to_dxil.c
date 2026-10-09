@@ -571,6 +571,8 @@ struct ntd_context {
    struct nir_shader *shader;
 
    struct dxil_module mod;
+   /* Authoritative wave size actually emitted into DXIL metadata. */
+   uint32_t emitted_wave_size;
 
    struct util_dynarray srv_metadata_nodes;
    const struct dxil_value *srv_handles[MAX_SRVS];
@@ -2057,6 +2059,7 @@ emit_metadata(struct ntd_context *ctx)
           ctx->shader->info.min_subgroup_size == ctx->shader->info.max_subgroup_size &&
           ctx->shader->info.min_subgroup_size == ctx->shader->info.api_subgroup_size &&
           ctx->shader->info.min_subgroup_size > 1) {
+         ctx->emitted_wave_size = ctx->shader->info.min_subgroup_size;
          if (ctx->mod.minor_version < 8) {
             if (!emit_tag(ctx, DXIL_SHADER_TAG_WAVE_SIZE, emit_wave_size(ctx)))
                return false;
@@ -6578,11 +6581,11 @@ void dxil_fill_validation_state(struct ntd_context *ctx,
       psv2->num_threads_x = MAX2(ctx->shader->info.workgroup_size[0], 1);
       psv2->num_threads_y = MAX2(ctx->shader->info.workgroup_size[1], 1);
       psv2->num_threads_z = MAX2(ctx->shader->info.workgroup_size[2], 1);
-      if (ctx->shader->info.min_subgroup_size == ctx->shader->info.max_subgroup_size &&
-          ctx->shader->info.min_subgroup_size == ctx->shader->info.api_subgroup_size &&
-          ctx->shader->info.min_subgroup_size > 1) {
-         psv0->max_expected_wave_lane_count = ctx->shader->info.min_subgroup_size;
-         psv0->min_expected_wave_lane_count = ctx->shader->info.min_subgroup_size;
+      /* Match the emitted module rather than recomputing its contract from
+       * NIR. A missing WaveSize tag must retain the unrestricted defaults. */
+      if (ctx->emitted_wave_size) {
+         psv0->max_expected_wave_lane_count = ctx->emitted_wave_size;
+         psv0->min_expected_wave_lane_count = ctx->emitted_wave_size;
       }
       break;
    case DXIL_GEOMETRY_SHADER:

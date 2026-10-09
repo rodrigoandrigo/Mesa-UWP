@@ -31,6 +31,7 @@
 #include "spirv_to_dxil.h"
 
 #include "dxil_validator.h"
+#include "dxil_container.h"
 #include "nir_xfb_info.h"
 
 #include "vk_alloc.h"
@@ -41,9 +42,297 @@
 
 #include "util/os_time.h"
 #include "util/u_debug.h"
+#include "util/u_atomic.h"
 
 #ifdef _XBOX_UWP
 static bool dzn_uwp_pso_diagnostic_reported;
+static int dzn_dynamic_pso_diagnostic_count;
+#endif
+
+#ifdef _XBOX_UWP
+static void
+dzn_diagnose_shader_container(const char *stage, const D3D12_SHADER_BYTECODE *shader)
+{
+   const uint8_t *bytes = shader->pShaderBytecode;
+   if (!bytes || shader->BytecodeLength < 32)
+      return;
+   uint32_t header[8];
+   memcpy(header, bytes, sizeof(header));
+   if (header[0] != DXIL_FOURCC('D', 'X', 'B', 'C') ||
+       header[6] > shader->BytecodeLength || header[6] < 32 ||
+       header[7] > (header[6] - 32) / 4) {
+      debug_printf("DZN: shader requirements stage=%s invalid container header\n", stage);
+      return;
+   }
+   for (uint32_t i = 0; i < header[7]; i++) {
+      uint32_t offset, part[2];
+      memcpy(&offset, bytes + 32 + i * 4, sizeof(offset));
+      if (offset > header[6] - 8)
+         return;
+      memcpy(part, bytes + offset, sizeof(part));
+      if (part[1] > header[6] - offset - 8)
+         return;
+      const uint8_t *payload = bytes + offset + 8;
+      if (part[0] == DXIL_SFI0 && part[1] >= 8) {
+         uint64_t flags;
+         memcpy(&flags, payload, sizeof(flags));
+         debug_printf("DZN: shader requirements stage=%s SFI0=0x%016llx\n", stage, (unsigned long long)flags);
+      } else if (part[0] == DXIL_DXIL && part[1] >= 16) {
+         uint32_t program, version;
+         memcpy(&program, payload, sizeof(program));
+         memcpy(&version, payload + 12, sizeof(version));
+         debug_printf("DZN: shader requirements stage=%s kind=%u model=%u.%u dxil=0x%08x\n",
+                      stage, program >> 16, (program >> 4) & 15, program & 15, version);
+      } else if (part[0] == DXIL_RTS0) {
+         debug_printf("DZN: shader requirements stage=%s embedded-root bytes=%u hash=%08x\n", stage, part[1], _mesa_hash_data(payload, part[1]));
+      }
+   }
+}
+
+static void
+dzn_diagnose_dxil(struct dzn_device *device, const char *stage,
+                  const D3D12_SHADER_BYTECODE *shader)
+{
+   dzn_diagnose_shader_container(stage, shader);
+   if (!shader->pShaderBytecode || !shader->BytecodeLength) {
+      debug_printf("DZN: DXIL diagnostic stage=%s empty\n", stage);
+      return;
+   }
+   struct dzn_instance *instance = container_of(
+      device->vk.physical->instance, struct dzn_instance, vk);
+   if (!instance->dxil_validator) {
+      debug_printf("DZN: DXIL diagnostic stage=%s validator unavailable\n", stage);
+      return;
+   }
+   /* Validation may sign/modify its input. Never modify the game's shader. */
+   void *copy = malloc(shader->BytecodeLength);
+   if (!copy) {
+      debug_printf("DZN: DXIL diagnostic stage=%s allocation failed\n", stage);
+      return;
+   }
+   memcpy(copy, shader->pShaderBytecode, shader->BytecodeLength);
+   char *error = NULL;
+   bool valid = dxil_validate_module(instance->dxil_validator, copy,
+                                      shader->BytecodeLength, &error);
+   debug_printf("DZN: DXIL diagnostic stage=%s validation=%s validator=%u bytes=%zu original=%08x validated=%08x\n",
+                stage, valid ? "PASS" : "FAIL",
+                dxil_get_validator_version(instance->dxil_validator),
+                shader->BytecodeLength,
+                _mesa_hash_data(shader->pShaderBytecode, shader->BytecodeLength),
+                _mesa_hash_data(copy, shader->BytecodeLength));
+   if (error) {
+      debug_printf("DZN: DXIL diagnostic stage=%s error=%.4096s\n", stage, error);
+      ralloc_free(error);
+   }
+   char *disasm = dxil_disasm_module(instance->dxil_validator, copy, shader->BytecodeLength);
+   if (disasm) {
+      char *context = NULL;
+      unsigned remaining = 0, emitted = 0;
+      for (char *line = strtok_s(disasm, "\r\n", &context);
+           line && emitted < 64; line = strtok_s(NULL, "\r\n", &context)) {
+         if (strstr(line, "Input signature:") || strstr(line, "Output signature:") ||
+             strstr(line, "shader model") || strstr(line, "Shader Model"))
+            remaining = 20;
+         if (remaining) {
+            debug_printf("DZN: DXIL signature stage=%s %.512s\n", stage, line);
+            remaining--;
+            emitted++;
+         }
+      }
+      ralloc_free(disasm);
+   } else {
+      debug_printf("DZN: DXIL diagnostic stage=%s disassembly unavailable\n", stage);
+   }
+   free(copy);
+}
+
+static void
+dzn_try_diagnostic_pso(struct dzn_device *device,
+                       const D3D12_PIPELINE_STATE_STREAM_DESC *stream,
+                       size_t ds_offset, bool ds2, bool disable_depth)
+{
+   uintptr_t copy[MAX_GFX_PIPELINE_STATE_STREAM_SIZE / sizeof(uintptr_t)];
+   if (stream->SizeInBytes > sizeof(copy))
+      return;
+   memcpy(copy, stream->pPipelineStateSubobjectStream, stream->SizeInBytes);
+   void *descriptor = (uint8_t *)copy + ds_offset;
+   if (ds2) {
+      D3D12_DEPTH_STENCIL_DESC2 *ds = descriptor;
+      ds->DepthBoundsTestEnable = false;
+      if (disable_depth) {
+         ds->DepthEnable = false;
+         ds->DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+         ds->StencilEnable = false;
+      }
+   } else {
+      D3D12_DEPTH_STENCIL_DESC1 *ds = descriptor;
+      ds->DepthBoundsTestEnable = false;
+      if (disable_depth) {
+         ds->DepthEnable = false;
+         ds->DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+         ds->StencilEnable = false;
+      }
+   }
+   D3D12_PIPELINE_STATE_STREAM_DESC trial = *stream;
+   trial.pPipelineStateSubobjectStream = copy;
+   ID3D12PipelineState *state = NULL;
+   HRESULT result = ID3D12Device4_CreatePipelineState(device->dev, &trial,
+                      &IID_ID3D12PipelineState, (void **)&state);
+   debug_printf("DZN: PSO A/B test=%s hr=0x%08x created=%u diagnostic-only\n",
+                disable_depth ? "depth-stencil-disabled" : "depth-bounds-disabled",
+                (unsigned)result, state != NULL);
+   /* Never bind/submit this altered PSO or insert it in the pipeline cache. */
+   if (state)
+      ID3D12PipelineState_Release(state);
+}
+
+/* Inspect the final stream, not the template: dynamic state may have replaced
+ * descriptors or shader bytecode. Bounded failure-only logging also works on
+ * retail Xbox devices without the optional D3D12 debug layer. */
+static void
+dzn_diagnose_dynamic_pso(struct dzn_device *device,
+                         const struct dzn_graphics_pipeline *pipeline,
+                         const D3D12_PIPELINE_STATE_STREAM_DESC *stream,
+                         HRESULT failure, uint32_t dynamic)
+{
+   int report = p_atomic_inc_return(&dzn_dynamic_pso_diagnostic_count);
+   if (report > 4)
+      return;
+   debug_printf("DZN: PSO diagnostic %d hr=0x%08x dynamic=0x%08x bytes=%zu removed=0x%08x\n",
+                report, (unsigned)failure, dynamic, stream->SizeInBytes,
+                (unsigned)ID3D12Device4_GetDeviceRemovedReason(device->dev));
+   size_t offset = 0;
+   size_t ds_offset = 0;
+   bool ds2 = false;
+   D3D12_GRAPHICS_PIPELINE_STATE_DESC classic = {0};
+   classic.SampleMask = UINT_MAX;
+   classic.SampleDesc.Count = 1;
+   bool classic_supported = true;
+   struct dzn_physical_device *pdev = container_of(device->vk.physical, struct dzn_physical_device, vk);
+   /* Repeat cached query evidence here even if startup logging was missed.
+    * Values from a failed query must not be interpreted as capability results. */
+   debug_printf("DZN: PSO capabilities fp64-hr=0x%08x fp64=%u int64-hr=0x%08x int64=%u fp16-hr=0x%08x native16=%u\n",
+                (unsigned)pdev->options_query_hr, pdev->options.DoublePrecisionFloatShaderOps,
+                (unsigned)pdev->options1_query_hr, pdev->options1.Int64ShaderOps,
+                (unsigned)pdev->options4_query_hr, pdev->options4.Native16BitShaderOpsSupported);
+   debug_printf("DZN: root signature version=%u bindless=%u sets=%u set-params=%u sysval=%u push=%u dynamic=%u descriptors=%u/%u dynamic-buffers=%u present=%u\n",
+                pdev->root_sig_version, device->bindless, pipeline->base.set_count,
+                pipeline->base.root.sets_param_count, pipeline->base.root.sysval_cbv_param_idx,
+                pipeline->base.root.push_constant_cbv_param_idx,
+                pipeline->base.root.dynamic_buffer_bindless_param_idx,
+                pipeline->base.desc_count[0], pipeline->base.desc_count[1],
+                pipeline->base.dynamic_buffer_count, pipeline->base.root.sig != NULL);
+   while (offset < stream->SizeInBytes) {
+      offset = ALIGN_POT(offset, alignof(void *));
+      if (offset + sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) > stream->SizeInBytes)
+         break;
+      const uint8_t *bytes = (const uint8_t *)stream->pPipelineStateSubobjectStream + offset;
+      D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
+      memcpy(&type, bytes, sizeof(type));
+      size_t size = 0;
+#define PSO_CASE(id, desc_type, details) \
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_##id: { \
+         struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type; desc_type desc; } wrapper; \
+         size = sizeof(wrapper); \
+         if (size > stream->SizeInBytes - offset) goto truncated; \
+         memcpy(&wrapper, bytes, size); \
+         const desc_type *d = &wrapper.desc; \
+         details; \
+         break; }
+      switch (type) {
+      PSO_CASE(ROOT_SIGNATURE, ID3D12RootSignature *, (void)d; classic.pRootSignature = wrapper.desc)
+      PSO_CASE(VS, D3D12_SHADER_BYTECODE, classic.VS = *d; dzn_diagnose_dxil(device, "VS", d))
+      PSO_CASE(PS, D3D12_SHADER_BYTECODE, classic.PS = *d; dzn_diagnose_dxil(device, "PS", d))
+      PSO_CASE(HS, D3D12_SHADER_BYTECODE, classic.HS = *d; dzn_diagnose_dxil(device, "HS", d))
+      PSO_CASE(DS, D3D12_SHADER_BYTECODE, classic.DS = *d; dzn_diagnose_dxil(device, "DS", d))
+      PSO_CASE(GS, D3D12_SHADER_BYTECODE, classic.GS = *d; dzn_diagnose_dxil(device, "GS", d))
+      PSO_CASE(INPUT_LAYOUT, D3D12_INPUT_LAYOUT_DESC,
+         classic.InputLayout = *d;
+         debug_printf("DZN: input elements=%u\n", d->NumElements);
+         for (UINT i = 0; i < d->NumElements; i++) {
+            const D3D12_INPUT_ELEMENT_DESC *e = &d->pInputElementDescs[i];
+            debug_printf("DZN: input %u semantic=%s/%u format=%u slot=%u offset=%u class=%u step=%u\n", i, e->SemanticName, e->SemanticIndex, e->Format, e->InputSlot, e->AlignedByteOffset, e->InputSlotClass, e->InstanceDataStepRate);
+         })
+      PSO_CASE(BLEND, D3D12_BLEND_DESC,
+         classic.BlendState = *d;
+         debug_printf("DZN: blend independent=%u coverage=%u\n", d->IndependentBlendEnable, d->AlphaToCoverageEnable);
+         for (unsigned i = 0; i < 8; i++) {
+            const D3D12_RENDER_TARGET_BLEND_DESC *b = &d->RenderTarget[i];
+            debug_printf("DZN: blend %u enable=%u logic=%u/%u color=%u/%u/%u alpha=%u/%u/%u mask=%u\n", i, b->BlendEnable, b->LogicOpEnable, b->LogicOp, b->SrcBlend, b->DestBlend, b->BlendOp, b->SrcBlendAlpha, b->DestBlendAlpha, b->BlendOpAlpha, b->RenderTargetWriteMask);
+         })
+      PSO_CASE(DEPTH_STENCIL1, D3D12_DEPTH_STENCIL_DESC1,
+         memcpy(&classic.DepthStencilState, d, sizeof(classic.DepthStencilState));
+         ds_offset = offset + offsetof(struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type; D3D12_DEPTH_STENCIL_DESC1 desc; }, desc);
+         debug_printf("DZN: depth enable=%u write=%u func=%u bounds=%u stencil=%u masks=%u/%u front=%u/%u/%u/%u back=%u/%u/%u/%u\n", d->DepthEnable, d->DepthWriteMask, d->DepthFunc, d->DepthBoundsTestEnable, d->StencilEnable, d->StencilReadMask, d->StencilWriteMask, d->FrontFace.StencilFailOp, d->FrontFace.StencilDepthFailOp, d->FrontFace.StencilPassOp, d->FrontFace.StencilFunc, d->BackFace.StencilFailOp, d->BackFace.StencilDepthFailOp, d->BackFace.StencilPassOp, d->BackFace.StencilFunc))
+      PSO_CASE(DEPTH_STENCIL2, D3D12_DEPTH_STENCIL_DESC2,
+         classic_supported = false;
+         ds2 = true;
+         ds_offset = offset + offsetof(struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type; D3D12_DEPTH_STENCIL_DESC2 desc; }, desc);
+         debug_printf("DZN: depth2 enable=%u write=%u func=%u bounds=%u stencil=%u\n", d->DepthEnable, d->DepthWriteMask, d->DepthFunc, d->DepthBoundsTestEnable, d->StencilEnable))
+      PSO_CASE(RASTERIZER, D3D12_RASTERIZER_DESC, classic.RasterizerState = *d; debug_printf("DZN: raster fill=%u cull=%u ccw=%u bias=%d clamp=%g slope=%g clip=%u msaa=%u line=%u forced=%u conservative=%u\n", d->FillMode, d->CullMode, d->FrontCounterClockwise, d->DepthBias, d->DepthBiasClamp, d->SlopeScaledDepthBias, d->DepthClipEnable, d->MultisampleEnable, d->AntialiasedLineEnable, d->ForcedSampleCount, d->ConservativeRaster))
+      PSO_CASE(RASTERIZER1, D3D12_RASTERIZER_DESC1, classic_supported = false; debug_printf("DZN: raster1 fill=%u cull=%u bias=%g clip=%u forced=%u\n", d->FillMode, d->CullMode, d->DepthBias, d->DepthClipEnable, d->ForcedSampleCount))
+      PSO_CASE(RASTERIZER2, D3D12_RASTERIZER_DESC2, classic_supported = false; debug_printf("DZN: raster2 fill=%u cull=%u bias=%g clip=%u forced=%u\n", d->FillMode, d->CullMode, d->DepthBias, d->DepthClipEnable, d->ForcedSampleCount))
+      PSO_CASE(RENDER_TARGET_FORMATS, struct D3D12_RT_FORMAT_ARRAY,
+         classic.NumRenderTargets = d->NumRenderTargets;
+         memcpy(classic.RTVFormats, d->RTFormats, sizeof(classic.RTVFormats));
+         debug_printf("DZN: render targets=%u\n", d->NumRenderTargets);
+         for (unsigned i = 0; i < 8; i++) debug_printf("DZN: RT %u format=%u\n", i, d->RTFormats[i]))
+      PSO_CASE(DEPTH_STENCIL_FORMAT, DXGI_FORMAT, classic.DSVFormat = *d; debug_printf("DZN: depth format=%u\n", *d))
+      PSO_CASE(PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE, classic.PrimitiveTopologyType = *d; debug_printf("DZN: topology=%u\n", *d))
+      PSO_CASE(IB_STRIP_CUT_VALUE, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE, classic.IBStripCutValue = *d; debug_printf("DZN: strip cut=%u\n", *d))
+      PSO_CASE(SAMPLE_DESC, DXGI_SAMPLE_DESC, classic.SampleDesc = *d; debug_printf("DZN: samples=%u quality=%u\n", d->Count, d->Quality))
+      PSO_CASE(SAMPLE_MASK, UINT, classic.SampleMask = *d; debug_printf("DZN: sample mask=%08x\n", *d))
+      PSO_CASE(FLAGS, D3D12_PIPELINE_STATE_FLAGS, classic.Flags = *d; debug_printf("DZN: flags=%u\n", *d))
+      PSO_CASE(STREAM_OUTPUT, D3D12_STREAM_OUTPUT_DESC, classic.StreamOutput = *d; debug_printf("DZN: stream output entries=%u strides=%u raster=%u\n", d->NumEntries, d->NumStrides, d->RasterizedStream))
+      PSO_CASE(VIEW_INSTANCING, D3D12_VIEW_INSTANCING_DESC, classic_supported = false; debug_printf("DZN: view instances=%u flags=%u\n", d->ViewInstanceCount, d->Flags))
+      default:
+         debug_printf("DZN: unknown PSO subobject=%u offset=%zu\n", type, offset);
+         return;
+      }
+#undef PSO_CASE
+      debug_printf("DZN: subobject=%u offset=%zu size=%zu hash=%08x\n", type, offset, size, _mesa_hash_data(bytes, size));
+      offset += size;
+   }
+   if (ds_offset) {
+      dzn_try_diagnostic_pso(device, stream, ds_offset, ds2, false);
+      dzn_try_diagnostic_pso(device, stream, ds_offset, ds2, true);
+   } else {
+      debug_printf("DZN: PSO A/B skipped: no depth-stencil descriptor\n");
+   }
+   /* Depth bounds is absent from the classic API. Compare against the stream
+    * trial with bounds disabled; do not claim identical original state. */
+   if (classic_supported) {
+      ID3D12PipelineState *state = NULL;
+      HRESULT result = ID3D12Device4_CreateGraphicsPipelineState(device->dev,
+                          &classic, &IID_ID3D12PipelineState, (void **)&state);
+      debug_printf("DZN: PSO classic hr=0x%08x created=%u depth-bounds-omitted diagnostic-only\n", (unsigned)result, state != NULL);
+      if (state)
+         ID3D12PipelineState_Release(state);
+   } else {
+      debug_printf("DZN: PSO classic SKIPPED: stream state not representable\n");
+   }
+   ID3D12InfoQueue *queue = NULL;
+   HRESULT query = ID3D12Device4_QueryInterface(device->dev, &IID_ID3D12InfoQueue, (void **)&queue);
+   debug_printf("DZN: info queue hr=0x%08x\n", (unsigned)query);
+   if (SUCCEEDED(query)) {
+      uint64_t count = ID3D12InfoQueue_GetNumStoredMessagesAllowedByRetrievalFilter(queue);
+      debug_printf("DZN: info queue messages=%llu\n", (unsigned long long)count);
+      for (uint64_t i = count > 16 ? count - 16 : 0; i < count; i++) {
+         SIZE_T size = 0;
+         if (FAILED(ID3D12InfoQueue_GetMessage(queue, i, NULL, &size)) || size > 65536)
+            continue;
+         D3D12_MESSAGE *message = malloc(size);
+         if (message && SUCCEEDED(ID3D12InfoQueue_GetMessage(queue, i, message, &size)))
+            debug_printf("DZN: D3D12 message id=%u severity=%u: %s\n", message->ID, message->Severity, message->pDescription);
+         free(message);
+      }
+      ID3D12InfoQueue_Release(queue);
+   }
+   debug_printf("DZN: PSO diagnostic end\n");
+   return;
+truncated:
+   debug_printf("DZN: truncated PSO stream at offset=%zu\n", offset);
+}
 #endif
 
 #define d3d12_pipeline_state_stream_new_desc(__stream, __maxstreamsz, __id, __type, __desc) \
@@ -490,11 +779,11 @@ dzn_pipeline_compile_shader(struct dzn_device *device,
       container_of(device->vk.physical, struct dzn_physical_device, vk);
    struct nir_to_dxil_options opts = {
       .environment = DXIL_ENVIRONMENT_VULKAN,
-      .lower_int16 = !pdev->options4.Native16BitShaderOpsSupported &&
-      /* Don't lower 16-bit types if they can only come from min-precision */
-         (device->vk.enabled_extensions.KHR_shader_float16_int8 ||
-          device->vk.enabled_features.shaderFloat16 ||
-          device->vk.enabled_features.shaderInt16),
+      /* Internal lowering (including vertex unpacking) can introduce 16-bit
+       * operations even when the application enables no 16-bit extension.
+       * Use the device capability, not application feature enablement, to
+       * select the existing DXIL conversion/bit-size lowering passes. */
+      .lower_int16 = !pdev->options4.Native16BitShaderOpsSupported,
       .shader_model_max = dzn_pipeline_get_shader_model(pdev,
                                                         nir->info.stage),
       .input_clip_size = input_clip_size,
@@ -558,7 +847,7 @@ dzn_pipeline_compile_shader(struct dzn_device *device,
 #endif
          ralloc_free(err);
       }
-      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return vk_error(device, VK_ERROR_UNKNOWN);
    }
 #endif
 
@@ -1864,16 +2153,33 @@ dzn_graphics_pipeline_translate_zsa(struct dzn_device *device,
          d3d12_gfx_pipeline_state_stream_new_desc(out, DEPTH_STENCIL2, D3D12_DEPTH_STENCIL_DESC2, stream_desc);
          pipeline->templates.desc_offsets.ds = (uintptr_t)stream_desc - (uintptr_t)out->pPipelineStateSubobjectStream;
          memset(stream_desc, 0, sizeof(*stream_desc));
+         stream_desc->DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+         stream_desc->FrontFace.StencilFailOp = stream_desc->BackFace.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+         stream_desc->FrontFace.StencilDepthFailOp = stream_desc->BackFace.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+         stream_desc->FrontFace.StencilPassOp = stream_desc->BackFace.StencilPassOp = D3D12_STENCIL_OP_KEEP;
+         stream_desc->FrontFace.StencilFunc = stream_desc->BackFace.StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
       } else {
          d3d12_gfx_pipeline_state_stream_new_desc(out, DEPTH_STENCIL1, D3D12_DEPTH_STENCIL_DESC1, stream_desc);
          pipeline->templates.desc_offsets.ds = (uintptr_t)stream_desc - (uintptr_t)out->pPipelineStateSubobjectStream;
          memset(stream_desc, 0, sizeof(*stream_desc));
+         stream_desc->DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+         stream_desc->FrontFace.StencilFailOp = stream_desc->BackFace.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+         stream_desc->FrontFace.StencilDepthFailOp = stream_desc->BackFace.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+         stream_desc->FrontFace.StencilPassOp = stream_desc->BackFace.StencilPassOp = D3D12_STENCIL_OP_KEEP;
+         stream_desc->FrontFace.StencilFunc = stream_desc->BackFace.StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
       }
       return;
    }
 
    D3D12_DEPTH_STENCIL_DESC2 desc;
    memset(&desc, 0, sizeof(desc));
+   /* Disabled Vulkan stencil members are ignored, but zero is not a valid
+    * D3D12 stencil operation/comparison. Retail drivers may validate them. */
+   desc.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+   desc.FrontFace.StencilFailOp = desc.BackFace.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+   desc.FrontFace.StencilDepthFailOp = desc.BackFace.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+   desc.FrontFace.StencilPassOp = desc.BackFace.StencilPassOp = D3D12_STENCIL_OP_KEEP;
+   desc.FrontFace.StencilFunc = desc.BackFace.StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
 
    bool has_no_depth = ri && ri->depthAttachmentFormat == VK_FORMAT_UNDEFINED;
    bool has_no_stencil = ri && ri->stencilAttachmentFormat == VK_FORMAT_UNDEFINED;
@@ -2039,6 +2345,17 @@ dzn_graphics_pipeline_translate_blend(struct dzn_graphics_pipeline *pipeline,
    bool support_alpha_blend_factor = pdev->options13.AlphaBlendFactorSupported;
 
    d3d12_gfx_pipeline_state_stream_new_desc(out, BLEND, D3D12_BLEND_DESC, desc);
+   /* Initialize all slots, including unused attachments and logic-op slots.
+    * Keep blending/writes disabled while supplying valid D3D12 enums. */
+   for (unsigned i = 0; i < MAX_RTS; i++) {
+      desc->RenderTarget[i].SrcBlend = D3D12_BLEND_ONE;
+      desc->RenderTarget[i].DestBlend = D3D12_BLEND_ZERO;
+      desc->RenderTarget[i].BlendOp = D3D12_BLEND_OP_ADD;
+      desc->RenderTarget[i].SrcBlendAlpha = D3D12_BLEND_ONE;
+      desc->RenderTarget[i].DestBlendAlpha = D3D12_BLEND_ZERO;
+      desc->RenderTarget[i].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+      desc->RenderTarget[i].LogicOp = D3D12_LOGIC_OP_NOOP;
+   }
    D3D12_LOGIC_OP logicop =
       in_blend->logicOpEnable ?
       translate_logic_op(in_blend->logicOp) : D3D12_LOGIC_OP_NOOP;
@@ -3130,12 +3447,16 @@ dzn_graphics_pipeline_get_state_locked(struct dzn_graphics_pipeline *pipeline,
       HRESULT hres = ID3D12Device4_CreatePipelineState(device->dev, &stream_desc,
                                                                 &IID_ID3D12PipelineState,
                                                                 (void**)(&variant->state));
-      free((void *)dynamic_vs.pShaderBytecode);
       if (FAILED(hres)) {
          debug_printf("DZN: dynamic graphics PSO failed HRESULT=0x%08x\n", (unsigned)hres);
+#ifdef _XBOX_UWP
+         dzn_diagnose_dynamic_pso(device, pipeline, &stream_desc, hres, dyn);
+#endif
+         free((void *)dynamic_vs.pShaderBytecode);
          ralloc_free(variant);
          return NULL;
       }
+      free((void *)dynamic_vs.pShaderBytecode);
       he = _mesa_hash_table_insert(pipeline->variants, &variant->key, variant);
       if (!he) {
          ID3D12PipelineState_Release(variant->state);

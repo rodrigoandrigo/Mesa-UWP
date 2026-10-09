@@ -623,6 +623,9 @@ dzn_physical_device_init_uuids(struct dzn_physical_device *pdev)
     */
    _mesa_blake3_init(&blake3_ctx);
    _mesa_blake3_update(&blake3_ctx,  mesa_version, strlen(mesa_version));
+   /* Do not reuse DXIL compiled with the old extension-gated 16-bit policy. */
+   static const char shader_policy[] = "dzn-device-native16-lowering-v2-wave-contract";
+   _mesa_blake3_update(&blake3_ctx, shader_policy, sizeof(shader_policy));
    disk_cache_get_function_identifier(dzn_physical_device_init_uuids, &blake3_ctx);
    _mesa_blake3_update(&blake3_ctx, &pdev->options,
       offsetof(struct dzn_physical_device, options21) + sizeof(pdev->options21) -
@@ -697,11 +700,22 @@ dzn_physical_device_cache_caps(struct dzn_physical_device *pdev)
    }
 
    ID3D12Device1_CheckFeatureSupport(pdev->dev, D3D12_FEATURE_ARCHITECTURE1, &pdev->architecture, sizeof(pdev->architecture));
-   ID3D12Device1_CheckFeatureSupport(pdev->dev, D3D12_FEATURE_D3D12_OPTIONS, &pdev->options, sizeof(pdev->options));
-   ID3D12Device1_CheckFeatureSupport(pdev->dev, D3D12_FEATURE_D3D12_OPTIONS1, &pdev->options1, sizeof(pdev->options1));
+   pdev->options_query_hr = ID3D12Device1_CheckFeatureSupport(pdev->dev, D3D12_FEATURE_D3D12_OPTIONS, &pdev->options, sizeof(pdev->options));
+   pdev->options1_query_hr = ID3D12Device1_CheckFeatureSupport(pdev->dev, D3D12_FEATURE_D3D12_OPTIONS1, &pdev->options1, sizeof(pdev->options1));
    ID3D12Device1_CheckFeatureSupport(pdev->dev, D3D12_FEATURE_D3D12_OPTIONS2, &pdev->options2, sizeof(pdev->options2));
    ID3D12Device1_CheckFeatureSupport(pdev->dev, D3D12_FEATURE_D3D12_OPTIONS3, &pdev->options3, sizeof(pdev->options3));
-   ID3D12Device1_CheckFeatureSupport(pdev->dev, D3D12_FEATURE_D3D12_OPTIONS4, &pdev->options4, sizeof(pdev->options4));
+   pdev->options4_query_hr = ID3D12Device1_CheckFeatureSupport(pdev->dev, D3D12_FEATURE_D3D12_OPTIONS4, &pdev->options4, sizeof(pdev->options4));
+#ifdef _XBOX_UWP
+   debug_printf("DZN: capability query OPTIONS hr=0x%08x valid=%u DoublePrecisionFloatShaderOps=%u bytes=%zu\n",
+                (unsigned)pdev->options_query_hr, SUCCEEDED(pdev->options_query_hr),
+                pdev->options.DoublePrecisionFloatShaderOps, sizeof(pdev->options));
+   debug_printf("DZN: capability query OPTIONS1 hr=0x%08x valid=%u Int64ShaderOps=%u WaveOps=%u bytes=%zu\n",
+                (unsigned)pdev->options1_query_hr, SUCCEEDED(pdev->options1_query_hr),
+                pdev->options1.Int64ShaderOps, pdev->options1.WaveOps, sizeof(pdev->options1));
+   debug_printf("DZN: capability query OPTIONS4 hr=0x%08x valid=%u Native16BitShaderOpsSupported=%u bytes=%zu\n",
+                (unsigned)pdev->options4_query_hr, SUCCEEDED(pdev->options4_query_hr),
+                pdev->options4.Native16BitShaderOpsSupported, sizeof(pdev->options4));
+#endif
    ID3D12Device1_CheckFeatureSupport(pdev->dev, D3D12_FEATURE_D3D12_OPTIONS12, &pdev->options12, sizeof(pdev->options12));
    ID3D12Device1_CheckFeatureSupport(pdev->dev, D3D12_FEATURE_D3D12_OPTIONS13, &pdev->options13, sizeof(pdev->options13));
    ID3D12Device1_CheckFeatureSupport(pdev->dev, D3D12_FEATURE_D3D12_OPTIONS14, &pdev->options14, sizeof(pdev->options14));
