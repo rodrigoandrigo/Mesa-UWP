@@ -571,8 +571,7 @@ struct ntd_context {
    struct nir_shader *shader;
 
    struct dxil_module mod;
-   /* Authoritative wave size actually emitted into DXIL metadata. */
-   uint32_t emitted_wave_size;
+   unsigned emitted_wave_size;
 
    struct util_dynarray srv_metadata_nodes;
    const struct dxil_value *srv_handles[MAX_SRVS];
@@ -959,10 +958,18 @@ emit_atomic_binop(struct ntd_context *ctx,
                   const struct dxil_value *coord[3],
                   const struct dxil_value *value)
 {
-   const struct dxil_func *func = dxil_get_function(&ctx->mod, "dx.op.atomicBinOp", DXIL_I32);
-
-   if (!func)
+   const bool is_64bit = dxil_value_type_bitsize_equal_to(value, 64);
+   if (is_64bit && ctx->mod.minor_version < 6) {
+      ctx->logger->log(ctx->logger->priv, "Typed 64-bit atomics require shader model 6.6\n");
       return NULL;
+   }
+   const struct dxil_func *func = dxil_get_function(&ctx->mod, "dx.op.atomicBinOp",
+                                                  is_64bit ? DXIL_I64 : DXIL_I32);
+
+   if (!func) {
+      ctx->logger->log(ctx->logger->priv, "Failed to create DXIL atomicBinOp declaration\n");
+      return NULL;
+   }
 
    const struct dxil_value *opcode =
       dxil_module_get_int32_const(&ctx->mod, DXIL_INTR_ATOMIC_BINOP);
@@ -973,7 +980,11 @@ emit_atomic_binop(struct ntd_context *ctx,
       coord[0], coord[1], coord[2], value
    };
 
-   return dxil_emit_call(&ctx->mod, func, args, ARRAY_SIZE(args));
+   const struct dxil_value *result =
+      dxil_emit_call(&ctx->mod, func, args, ARRAY_SIZE(args));
+   if (!result)
+      ctx->logger->log(ctx->logger->priv, "Failed to allocate DXIL atomicBinOp call\n");
+   return result;
 }
 
 static const struct dxil_value *
@@ -983,8 +994,12 @@ emit_atomic_cmpxchg(struct ntd_context *ctx,
                     const struct dxil_value *cmpval,
                     const struct dxil_value *newval)
 {
+   const bool is_64bit = dxil_value_type_bitsize_equal_to(cmpval, 64);
+   if (is_64bit && ctx->mod.minor_version < 6)
+      return NULL;
    const struct dxil_func *func =
-      dxil_get_function(&ctx->mod, "dx.op.atomicCompareExchange", DXIL_I32);
+      dxil_get_function(&ctx->mod, "dx.op.atomicCompareExchange",
+                        is_64bit ? DXIL_I64 : DXIL_I32);
 
    if (!func)
       return NULL;
@@ -2059,7 +2074,6 @@ emit_metadata(struct ntd_context *ctx)
           ctx->shader->info.min_subgroup_size == ctx->shader->info.max_subgroup_size &&
           ctx->shader->info.min_subgroup_size == ctx->shader->info.api_subgroup_size &&
           ctx->shader->info.min_subgroup_size > 1) {
-         ctx->emitted_wave_size = ctx->shader->info.min_subgroup_size;
          if (ctx->mod.minor_version < 8) {
             if (!emit_tag(ctx, DXIL_SHADER_TAG_WAVE_SIZE, emit_wave_size(ctx)))
                return false;
@@ -2067,6 +2081,7 @@ emit_metadata(struct ntd_context *ctx)
             if (!emit_tag(ctx, DXIL_SHADER_TAG_WAVE_SIZE_RANGE, emit_wave_size_range(ctx)))
                return false;
          }
+         ctx->emitted_wave_size = ctx->shader->info.min_subgroup_size;
       }
    }
 
@@ -4317,8 +4332,10 @@ emit_image_atomic(struct ntd_context *ctx, nir_intrinsic_instr *intr)
    const struct dxil_value *handle = intr->intrinsic == nir_intrinsic_bindless_image_atomic ?
       create_image_handle(ctx, intr) :
       get_resource_handle(ctx, &intr->src[0], DXIL_RESOURCE_CLASS_UAV, DXIL_RESOURCE_KIND_TEXTURE2D);
-   if (!handle)
+   if (!handle) {
+      ctx->logger->log(ctx->logger->priv, "Failed to create image atomic UAV handle\n");
       return false;
+   }
 
    bool is_array = false;
    if (intr->intrinsic == nir_intrinsic_image_deref_atomic)
@@ -4341,22 +4358,30 @@ emit_image_atomic(struct ntd_context *ctx, nir_intrinsic_instr *intr)
    assert(num_coords <= nir_src_num_components(intr->src[1]));
    for (unsigned i = 0; i < num_coords; ++i) {
       coord[i] = get_src(ctx, &intr->src[1], i, nir_type_uint);
-      if (!coord[i])
+      if (!coord[i]) {
+         ctx->logger->log(ctx->logger->priv, "Failed to obtain image atomic coordinate\n");
          return false;
+      }
    }
 
    nir_atomic_op nir_op = nir_intrinsic_atomic_op(intr);
    enum dxil_atomic_op dxil_op = nir_atomic_to_dxil_atomic(nir_op);
    nir_alu_type type = nir_atomic_op_type(nir_op);
+   if (intr->def.bit_size == 64)
+      ctx->mod.feats.atomic_int64_typed = true;
    const struct dxil_value *value = get_src(ctx, &intr->src[3], 0, type);
-   if (!value)
+   if (!value) {
+      ctx->logger->log(ctx->logger->priv, "Failed to obtain image atomic value\n");
       return false;
+   }
 
    const struct dxil_value *retval =
       emit_atomic_binop(ctx, handle, dxil_op, coord, value);
 
-   if (!retval)
+   if (!retval) {
+      ctx->logger->log(ctx->logger->priv, "Failed to emit image atomic DXIL call\n");
       return false;
+   }
 
    store_def(ctx, &intr->def, 0, retval);
    return true;
@@ -4396,8 +4421,11 @@ emit_image_atomic_comp_swap(struct ntd_context *ctx, nir_intrinsic_instr *intr)
          return false;
    }
 
-   const struct dxil_value *cmpval = get_src(ctx, &intr->src[3], 0, nir_type_uint);
-   const struct dxil_value *newval = get_src(ctx, &intr->src[4], 0, nir_type_uint);
+   nir_alu_type value_type = intr->def.bit_size == 64 ? nir_type_uint64 : nir_type_uint;
+   const struct dxil_value *cmpval = get_src(ctx, &intr->src[3], 0, value_type);
+   const struct dxil_value *newval = get_src(ctx, &intr->src[4], 0, value_type);
+   if (intr->def.bit_size == 64)
+      ctx->mod.feats.atomic_int64_typed = true;
    if (!cmpval || !newval)
       return false;
 
@@ -6581,8 +6609,6 @@ void dxil_fill_validation_state(struct ntd_context *ctx,
       psv2->num_threads_x = MAX2(ctx->shader->info.workgroup_size[0], 1);
       psv2->num_threads_y = MAX2(ctx->shader->info.workgroup_size[1], 1);
       psv2->num_threads_z = MAX2(ctx->shader->info.workgroup_size[2], 1);
-      /* Match the emitted module rather than recomputing its contract from
-       * NIR. A missing WaveSize tag must retain the unrestricted defaults. */
       if (ctx->emitted_wave_size) {
          psv0->max_expected_wave_lane_count = ctx->emitted_wave_size;
          psv0->min_expected_wave_lane_count = ctx->emitted_wave_size;

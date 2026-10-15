@@ -3017,7 +3017,6 @@ dxil_nir_pad_tes_input_signature(nir_shader *tes, const nir_shader *tcs)
       unsigned loc = out_var->data.location;
       switch (loc) {
       case VARYING_SLOT_POS:
-      case VARYING_SLOT_PSIZ:
       case VARYING_SLOT_PRIMITIVE_ID:
       case VARYING_SLOT_LAYER:
       case VARYING_SLOT_VIEWPORT:
@@ -3029,7 +3028,9 @@ dxil_nir_pad_tes_input_signature(nir_shader *tes, const nir_shader *tcs)
          intra_accessed = tcs_intra_patch_read & BITFIELD_BIT(loc - VARYING_SLOT_PATCH0);
       else
          intra_accessed = tcs_intra_read & BITFIELD64_BIT(loc);
-      if (!intra_accessed)
+      /* PointSize is carried as TEXCOORD in DXIL, rather than a native HS
+       * system semantic. Match it even when the TES does not load it. */
+      if (!intra_accessed && loc != VARYING_SLOT_PSIZ)
          continue;
 
       if (nir_find_variable_with_location(tes, nir_var_shader_in, loc))

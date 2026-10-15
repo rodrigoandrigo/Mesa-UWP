@@ -238,7 +238,8 @@ struct dzn_physical_device {
    D3D12_FEATURE_DATA_D3D12_OPTIONS2 options2;
    D3D12_FEATURE_DATA_D3D12_OPTIONS3 options3;
    D3D12_FEATURE_DATA_D3D12_OPTIONS4 options4;
-   HRESULT options_query_hr, options1_query_hr, options4_query_hr;
+   D3D12_FEATURE_DATA_D3D12_OPTIONS7 options7;
+   D3D12_FEATURE_DATA_D3D12_OPTIONS9 options9;
    D3D12_FEATURE_DATA_D3D12_OPTIONS12 options12;
    D3D12_FEATURE_DATA_D3D12_OPTIONS13 options13;
    D3D12_FEATURE_DATA_D3D12_OPTIONS14 options14;
@@ -247,6 +248,7 @@ struct dzn_physical_device {
    D3D12_FEATURE_DATA_D3D12_OPTIONS17 options17;
    D3D12_FEATURE_DATA_D3D12_OPTIONS19 options19;
    D3D12_FEATURE_DATA_D3D12_OPTIONS21 options21;
+   D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT gpuva_support;
    VkPhysicalDeviceMemoryProperties memory;
    uint64_t allocated_memory[VK_MAX_MEMORY_HEAPS];
    D3D12_HEAP_FLAGS heap_flags_for_mem_type[VK_MAX_MEMORY_TYPES];
@@ -290,6 +292,7 @@ struct dzn_queue {
 };
 
 struct dzn_descriptor_heap {
+   uint32_t *format_defaults;
    ID3D12DescriptorHeap *heap;
    SIZE_T cpu_base;
    uint64_t gpu_base;
@@ -845,6 +848,8 @@ struct dzn_descriptor_pool {
    uint32_t free_offset[NUM_POOL_TYPES];
 };
 
+#define DZN_IMAGE_METADATA_BINDING 2
+
 #define MAX_SHADER_VISIBILITIES (D3D12_SHADER_VISIBILITY_PIXEL + 1)
 #define STATIC_SAMPLER_TAG (~0u - 1)
 
@@ -934,16 +939,19 @@ struct dzn_pipeline_layout {
        * in an array, to unique 0-based registers. This mapping is applied to the shaders
        * during pipeline creation. */
       uint32_t *base_reg;
+      uint32_t *image_offsets;
       uint8_t *binding_class;
    } binding_translation[MAX_SETS];
    uint32_t set_count;
    /* How much space needs to be allocated to copy descriptors during cmdbuf recording? */
    uint32_t desc_count[NUM_POOL_TYPES];
+   uint32_t image_metadata_offset;
    uint32_t dynamic_buffer_count;
    struct {
       uint32_t param_count;
       uint32_t sets_param_count;
       uint32_t sysval_cbv_param_idx;
+      uint32_t viewport_cbv_param_idx;
       uint32_t push_constant_cbv_param_idx;
       uint32_t dynamic_buffer_bindless_param_idx;
       D3D12_DESCRIPTOR_HEAP_TYPE type[MAX_SHADER_VISIBILITIES];
@@ -1040,6 +1048,7 @@ struct dzn_pipeline {
    struct {
       uint32_t sets_param_count;
       uint32_t sysval_cbv_param_idx;
+      uint32_t viewport_cbv_param_idx;
       uint32_t push_constant_cbv_param_idx;
       uint32_t dynamic_buffer_bindless_param_idx;
       D3D12_DESCRIPTOR_HEAP_TYPE type[MAX_SHADER_VISIBILITIES];
@@ -1048,6 +1057,7 @@ struct dzn_pipeline {
    struct dzn_pipeline_layout_set sets[MAX_SETS];
    uint32_t set_count;
    uint32_t desc_count[NUM_POOL_TYPES];
+   uint32_t image_metadata_offset;
    uint32_t dynamic_buffer_count;
    ID3D12PipelineState *state;
 };
@@ -1076,6 +1086,8 @@ struct dzn_graphics_pipeline {
    bool dynamic_viewport_count, dynamic_scissor_count;
    uint32_t patch_control_points;
    bool static_depth_test;
+   bool use_gs_for_large_points;
+   bool large_points_expanded;
    nir_shader *dynamic_vs;
    nir_shader_compiler_options dynamic_vs_options;
    uint32_t input_count;
@@ -1349,6 +1361,7 @@ dzn_buffer_supports_region_copy(struct dzn_physical_device *pdev,
 
 struct dzn_buffer_view {
    struct vk_object_base base;
+   VkFormat format;
 
    const struct dzn_buffer *buffer;
 

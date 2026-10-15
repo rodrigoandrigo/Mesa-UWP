@@ -88,6 +88,8 @@ spirv_caps = {
    .StorageImageWriteWithoutFormat = true,
    .ImageQuery = true,
    .Int64 = true,
+   .Int64Atomics = true,
+   .Int64ImageEXT = true,
    .Float64 = true,
    .IntegerFunctions2INTEL = true,
    .Tessellation = true,
@@ -211,7 +213,7 @@ temp_var_info(const struct glsl_type* type, unsigned* size, unsigned* align)
 }
 
 static nir_variable *
-add_runtime_data_var(nir_shader *nir, unsigned desc_set, unsigned binding)
+add_runtime_data_var(nir_shader *nir, unsigned desc_set, unsigned binding, bool split_viewports)
 {
    /* Generated Dozen point-fill GS can already declare the same runtime CBV. */
    nir_foreach_variable_with_modes(var, nir, nir_var_mem_ubo) {
@@ -221,7 +223,8 @@ add_runtime_data_var(nir_shader *nir, unsigned desc_set, unsigned binding)
    unsigned runtime_data_size =
       nir->info.stage == MESA_SHADER_COMPUTE
          ? sizeof(struct dxil_spirv_compute_runtime_data)
-         : sizeof(struct dxil_spirv_vertex_runtime_data);
+         : split_viewports ? offsetof(struct dxil_spirv_vertex_runtime_data, viewport_sizes)
+                           : sizeof(struct dxil_spirv_vertex_runtime_data);
 
    const struct glsl_type *array_type =
       glsl_array_type(glsl_uint_type(), runtime_data_size / sizeof(unsigned),
@@ -604,28 +607,35 @@ struct lower_point_size_data {
    nir_variable *position;
    nir_variable *point_size;
    nir_variable *point_center;
+   nir_variable *viewport_index;
 };
 
 static nir_def *
-load_viewport_size(nir_builder *b, const struct dxil_spirv_runtime_conf *conf)
+load_viewport_size(nir_builder *b, const struct dxil_spirv_runtime_conf *conf,
+                   nir_def *viewport_index)
 {
    const unsigned offset =
-      offsetof(struct dxil_spirv_vertex_runtime_data, viewport_width);
+      conf->split_viewport_sizes ? 0 : offsetof(struct dxil_spirv_vertex_runtime_data, viewport_sizes);
    nir_address_format format = nir_address_format_32bit_index_offset;
    nir_def *index = nir_vulkan_resource_index(
       b, nir_address_format_num_components(format),
       nir_address_format_bit_size(format), nir_imm_int(b, 0),
       .desc_set = conf->runtime_data_cbv.register_space,
-      .binding = conf->runtime_data_cbv.base_shader_register,
+      .binding = conf->runtime_data_cbv.base_shader_register + (conf->split_viewport_sizes ? 1 : 0),
       .desc_type = nir_descriptor_type_uniform_buffer);
    nir_def *descriptor = nir_load_vulkan_descriptor(
       b, nir_address_format_num_components(format),
       nir_address_format_bit_size(format), index,
       .desc_type = nir_descriptor_type_uniform_buffer);
-   return nir_trim_vector(
+   viewport_index = nir_umin_imm(b, viewport_index,
+                                DXIL_SPIRV_MAX_VIEWPORT - 1);
+   nir_def *byte_offset = nir_iadd_imm(b, nir_imul_imm(b, viewport_index, 8),
+                                      offset);
+   return nir_fabs(b, nir_trim_vector(
       b, nir_load_ubo(b, 2, 32, nir_channel(b, descriptor, 0),
-                      nir_imm_int(b, offset), .align_mul = 4,
-                      .range_base = offset, .range = 8), 2);
+                      byte_offset, .align_mul = 4,
+                      .range_base = offset,
+                      .range = sizeof(((struct dxil_spirv_vertex_runtime_data *)0)->viewport_sizes)), 2));
 }
 
 static bool
@@ -642,6 +652,9 @@ lower_point_size_emit(nir_builder *b, nir_instr *instr, void *cb_data)
       return false;
 
    struct lower_point_size_data *data = cb_data;
+   const bool captures_xfb = b->shader->xfb_info &&
+                             b->shader->xfb_info->output_count;
+   const unsigned raster_stream = captures_xfb ? 1 : 0;
    b->cursor = nir_before_instr(instr);
    /* EmitVertex makes all shader outputs undefined. Snapshot them before
     * expanding a point, and restore them before every corner, including
@@ -670,7 +683,9 @@ lower_point_size_emit(nir_builder *b, nir_instr *instr, void *cb_data)
    nir_def *point_size = nir_fclamp(b, nir_load_var(b, data->point_size),
                                     nir_imm_float(b, 1.0f),
                                     nir_imm_float(b, 64.0f));
-   nir_def *viewport = load_viewport_size(b, data->conf);
+   nir_def *viewport_index = data->viewport_index ?
+      nir_load_var(b, data->viewport_index) : nir_imm_int(b, 0);
+   nir_def *viewport = load_viewport_size(b, data->conf, viewport_index);
    nir_def *clip_w = nir_channel(b, position, 3);
    nir_def *half_extent = nir_fmul(
       b, nir_fdiv(b, nir_vec2(b, point_size, point_size), viewport), clip_w);
@@ -686,29 +701,20 @@ lower_point_size_emit(nir_builder *b, nir_instr *instr, void *cb_data)
          nir_fge(b, nir_channel(b, position, 0), nir_fneg(b, clip_w)),
          nir_fge(b, clip_w, nir_channel(b, position, 0))),
       nir_iand(b,
-         nir_iand(b,
-            nir_fge(b, nir_channel(b, position, 1), nir_fneg(b, clip_w)),
-            nir_fge(b, clip_w, nir_channel(b, position, 1))),
-         nir_iand(b,
-            nir_fge_imm(b, nir_channel(b, position, 2), 0.0f),
-            nir_fge(b, clip_w, nir_channel(b, position, 2)))));
-
-   /* The fragment lowering represents PointCoord as the window-space point
-    * center and subtracts it from FragCoord.  Preserve the original center;
-    * deriving it again from each expanded corner produces four different
-    * centers and invalid coordinates.
-    */
-   nir_def *point_center_ndc =
-      nir_fmul(b, nir_trim_vector(b, position, 2), nir_frcp(b, clip_w));
-   nir_def *point_center = nir_fmul(
-      b, nir_fadd_imm(b,
-         nir_fmul(b, point_center_ndc,
-            nir_vec2(b, nir_imm_float(b, 0.5f), nir_imm_float(b, -0.5f))),
-         0.5f), viewport);
+         nir_fge(b, nir_channel(b, position, 1), nir_fneg(b, clip_w)),
+         nir_fge(b, clip_w, nir_channel(b, position, 1))));
 
    static const int corners[4][2] = {
       { -1, -1 }, { -1, 1 }, { 1, -1 }, { 1, 1 },
    };
+   if (captures_xfb) {
+      /* Stream zero contains exactly the application's original point for
+       * transform feedback.  The expanded raster primitive uses stream one. */
+      for (unsigned j = 0; j < output_count; j++)
+         nir_copy_var(b, outputs[j].output, outputs[j].saved);
+      nir_emit_vertex(b, 0);
+      nir_end_primitive(b, 0);
+   }
    nir_if *visible = nir_push_if(b, center_inside);
    for (unsigned i = 0; i < ARRAY_SIZE(corners); i++) {
       for (unsigned j = 0; j < output_count; j++)
@@ -722,10 +728,15 @@ lower_point_size_emit(nir_builder *b, nir_instr *instr, void *cb_data)
                      nir_channel(b, position, 1)),
          nir_channel(b, position, 2), clip_w);
       nir_store_var(b, data->position, new_position, 0xf);
-      nir_store_var(b, data->point_center, nir_pad_vec4(b, point_center), 0xf);
-      nir_emit_vertex(b);
+      /* The four values interpolate to Vulkan's normalized PointCoord. */
+      nir_def *coord = nir_vec4(b,
+         nir_imm_float(b, corners[i][0] > 0 ? 1.0f : 0.0f),
+         nir_imm_float(b, corners[i][1] > 0 ? 1.0f : 0.0f),
+         nir_imm_float(b, 0.0f), nir_imm_float(b, 1.0f));
+      nir_store_var(b, data->point_center, coord, 0xf);
+      nir_emit_vertex(b, raster_stream);
    }
-   nir_end_primitive(b);
+   nir_end_primitive(b, raster_stream);
    nir_pop_if(b, visible);
    ralloc_free(outputs);
    nir_instr_remove(instr);
@@ -748,6 +759,8 @@ dxil_spirv_nir_lower_geometry_point_size(
          shader, nir_var_shader_out, VARYING_SLOT_PSIZ),
       .point_center = nir_find_variable_with_location(
          shader, nir_var_shader_out, VARYING_SLOT_PNTC),
+      .viewport_index = nir_find_variable_with_location(
+         shader, nir_var_shader_out, VARYING_SLOT_VIEWPORT),
    };
    if (!data.position || !data.point_size)
       return false;
@@ -762,7 +775,9 @@ dxil_spirv_nir_lower_geometry_point_size(
    }
 
    shader->info.gs.output_primitive = MESA_PRIM_TRIANGLE_STRIP;
-   shader->info.gs.vertices_out *= 4;
+   shader->info.gs.vertices_out *= shader->xfb_info && shader->xfb_info->output_count ? 5 : 4;
+   shader->info.gs.active_stream_mask =
+      shader->xfb_info && shader->xfb_info->output_count ? 3 : 1;
    return nir_shader_instructions_pass(shader, lower_point_size_emit,
                                        nir_metadata_control_flow, &data);
 }
@@ -852,7 +867,7 @@ dxil_spirv_write_pntc(nir_shader *nir, const struct dxil_spirv_runtime_conf *con
    };
    nir_variable *ubo_var = nir_get_binding_variable(nir, binding);
    if (!ubo_var)
-      add_runtime_data_var(nir, conf->runtime_data_cbv.register_space, conf->runtime_data_cbv.base_shader_register);
+      add_runtime_data_var(nir, conf->runtime_data_cbv.register_space, conf->runtime_data_cbv.base_shader_register, conf->split_viewport_sizes);
    return true;
 }
 
@@ -983,7 +998,8 @@ dxil_spirv_nir_link(nir_shader *nir, nir_shader *prev_stage_nir,
       if (nir->info.stage == MESA_SHADER_FRAGMENT) {
          nir->info.clip_distance_array_size = prev_stage_nir->info.clip_distance_array_size;
 
-         if (nir->info.inputs_read & VARYING_BIT_PNTC) {
+         if ((nir->info.inputs_read & VARYING_BIT_PNTC) &&
+             !conf->direct_point_coord) {
             NIR_PASS(_, prev_stage_nir, dxil_spirv_write_pntc, conf);
             NIR_PASS(_, nir, dxil_spirv_compute_pntc);
             metadata->requires_runtime_data = true;
@@ -1187,10 +1203,12 @@ dxil_spirv_nir_passes(nir_shader *nir,
    }
 
    if (!conf->fixed_point_size) {
-      NIR_PASS(metadata->requires_runtime_data, nir,
+      NIR_PASS(metadata->lowered_large_points, nir,
                dxil_spirv_nir_lower_geometry_point_size, conf);
+      metadata->requires_runtime_data |= metadata->lowered_large_points;
    }
-   NIR_PASS(_, nir, dxil_spirv_nir_discard_point_size_var);
+   if (!conf->preserve_point_size)
+      NIR_PASS(_, nir, dxil_spirv_nir_discard_point_size_var);
 
    NIR_PASS(_, nir, nir_remove_dead_variables,
               nir_var_shader_in | nir_var_shader_out |
@@ -1261,7 +1279,10 @@ dxil_spirv_nir_passes(nir_shader *nir,
 
    if (metadata->requires_runtime_data) {
       add_runtime_data_var(nir, conf->runtime_data_cbv.register_space,
-                           conf->runtime_data_cbv.base_shader_register);
+                           conf->runtime_data_cbv.base_shader_register, conf->split_viewport_sizes);
+      if (conf->split_viewport_sizes && nir->info.stage != MESA_SHADER_COMPUTE)
+         add_push_constant_var(nir, sizeof(((struct dxil_spirv_vertex_runtime_data *)0)->viewport_sizes),
+                               conf->runtime_data_cbv.register_space, conf->runtime_data_cbv.base_shader_register + 1);
    }
 
    if (push_constant_size > 0) {

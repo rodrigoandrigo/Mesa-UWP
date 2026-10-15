@@ -296,6 +296,13 @@ dzn_image_get_dxgi_format(const struct dzn_physical_device *pdev,
 {
    enum pipe_format pfmt = vk_format_to_pipe_format(format);
 
+   /* D3D12 represents a 64-bit integer typed UAV as two 32-bit channels.
+    * SM 6.6 atomic operations still treat that view as one 64-bit scalar. */
+   if (pfmt == PIPE_FORMAT_R64_UINT)
+      return DXGI_FORMAT_R32G32_UINT;
+   if (pfmt == PIPE_FORMAT_R64_SINT)
+      return DXGI_FORMAT_R32G32_SINT;
+
    if (pdev && !pdev->support_a4b4g4r4) {
       if (pfmt == PIPE_FORMAT_R4G4B4A4_UNORM)
          return DXGI_FORMAT_UNKNOWN;
@@ -1130,6 +1137,27 @@ dzn_image_view_prepare_srv_desc(struct dzn_image_view *iview)
       translate_swizzle(iview->vk.swizzle.a, 3),
    };
 
+   const struct dzn_image *image = container_of(iview->vk.image, struct dzn_image, vk);
+   const DXGI_FORMAT resource_family = dzn_get_typeless_dxgi_format(image->desc.Format);
+   const DXGI_FORMAT view_family = dzn_get_typeless_dxgi_format(iview->srv_desc.Format);
+   const bool rgba_resource = resource_family == DXGI_FORMAT_R8G8B8A8_TYPELESS;
+   const bool bgra_resource = resource_family == DXGI_FORMAT_B8G8R8A8_TYPELESS;
+   if ((rgba_resource && view_family == DXGI_FORMAT_B8G8R8A8_TYPELESS) ||
+       (bgra_resource && (iview->srv_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                          iview->srv_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB))) {
+      const bool srgb = iview->srv_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+                        iview->srv_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+      iview->srv_desc.Format = rgba_resource ?
+         (srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM) :
+         (srgb ? DXGI_FORMAT_B8G8R8A8_UNORM_SRGB : DXGI_FORMAT_B8G8R8A8_UNORM);
+      for (uint32_t i = 0; i < ARRAY_SIZE(swz); i++) {
+         if (swz[i] == D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0)
+            swz[i] = D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_2;
+         else if (swz[i] == D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_2)
+            swz[i] = D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0;
+      }
+   }
+
    /* Swap components to fake B4G4R4A4 support. */
    if (iview->vk.format == VK_FORMAT_B4G4R4A4_UNORM_PACK16) {
       if (pdev->support_a4b4g4r4) {
@@ -1623,6 +1651,7 @@ dzn_buffer_view_create(struct dzn_device *device,
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    vk_object_base_init(&device->vk, &bview->base, VK_OBJECT_TYPE_BUFFER_VIEW);
+   bview->format = pCreateInfo->format;
 
    enum pipe_format pfmt = vk_format_to_pipe_format(pCreateInfo->format);
    unsigned blksz = util_format_get_blocksize(pfmt);
