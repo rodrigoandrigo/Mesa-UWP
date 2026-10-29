@@ -97,6 +97,54 @@ dzn_meta_compile_shader(struct dzn_device *device, nir_shader *nir,
    slot->BytecodeLength = size;
 }
 
+static void
+dzn_meta_raw_image_merge_finish(struct dzn_device *device)
+{
+   if (device->raw_image_merge.reset)
+      ID3D12PipelineState_Release(device->raw_image_merge.reset);
+   if (device->raw_image_merge.merge)
+      ID3D12PipelineState_Release(device->raw_image_merge.merge);
+   if (device->raw_image_merge.root_sig)
+      ID3D12RootSignature_Release(device->raw_image_merge.root_sig);
+   memset(&device->raw_image_merge, 0, sizeof(device->raw_image_merge));
+}
+
+static VkResult
+dzn_meta_raw_image_merge_init(struct dzn_device *device)
+{
+   D3D12_ROOT_PARAMETER1 params[] = {
+      {.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+       .Constants = {.ShaderRegister = 0, .Num32BitValues = 3}},
+      {.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV, .Descriptor = {.ShaderRegister = 1}},
+      {.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV, .Descriptor = {.ShaderRegister = 2}},
+   };
+   D3D12_VERSIONED_ROOT_SIGNATURE_DESC root = {.Version = D3D_ROOT_SIGNATURE_VERSION_1_1,
+      .Desc_1_1 = {.NumParameters = ARRAY_SIZE(params), .pParameters = params}};
+   device->raw_image_merge.root_sig = dzn_device_create_root_sig(device, &root);
+   if (!device->raw_image_merge.root_sig)
+      return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   glsl_type_singleton_init_or_ref();
+   VkResult result = VK_SUCCESS;
+   for (unsigned i = 0; i < 2; i++) {
+      nir_shader *nir = dzn_nir_raw_image_merge_shader(i == 0);
+      D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {.pRootSignature = device->raw_image_merge.root_sig};
+      dzn_meta_compile_shader(device, nir, &desc.CS);
+      ID3D12PipelineState **state = i == 0 ? &device->raw_image_merge.reset : &device->raw_image_merge.merge;
+      HRESULT hr = ID3D12Device1_CreateComputePipelineState(device->dev, &desc,
+         &IID_ID3D12PipelineState, (void **)state);
+      free((void *)desc.CS.pShaderBytecode);
+      ralloc_free(nir);
+      if (FAILED(hr)) {
+         result = vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         break;
+      }
+   }
+   glsl_type_singleton_decref();
+   if (result != VK_SUCCESS)
+      dzn_meta_raw_image_merge_finish(device);
+   return result;
+}
+
 #define DZN_META_INDIRECT_DRAW_MAX_PARAM_COUNT 5
 
 static void
@@ -290,6 +338,76 @@ dzn_meta_large_point_draw_args_init(struct dzn_device *device)
 out:
    if (ret != VK_SUCCESS)
       dzn_meta_large_point_draw_args_finish(device);
+   free((void *)desc.CS.pShaderBytecode);
+   ralloc_free(nir);
+   glsl_type_singleton_decref();
+   return ret;
+}
+
+static void
+dzn_meta_query_reduce_finish(struct dzn_device *device)
+{
+   struct dzn_meta_large_point_draw_args *meta = &device->query_reduce;
+   if (meta->root_sig) {
+      ID3D12RootSignature_Release(meta->root_sig);
+      meta->root_sig = NULL;
+   }
+   if (meta->pipeline_state) {
+      ID3D12PipelineState_Release(meta->pipeline_state);
+      meta->pipeline_state = NULL;
+   }
+}
+
+static VkResult
+dzn_meta_query_reduce_init(struct dzn_device *device)
+{
+   struct dzn_instance *instance =
+      container_of(device->vk.physical->instance, struct dzn_instance, vk);
+   struct dzn_meta_large_point_draw_args *meta = &device->query_reduce;
+   D3D12_ROOT_PARAMETER1 params[3] = {
+      {
+         .ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+         .Constants = { .ShaderRegister = 0, .Num32BitValues = 2 },
+         .ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL,
+      },
+      {
+         .ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV,
+         .Descriptor = { .ShaderRegister = 1, .Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE },
+         .ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL,
+      },
+      {
+         .ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV,
+         .Descriptor = { .ShaderRegister = 2, .Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE },
+         .ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL,
+      },
+   };
+   D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc = {
+      .Version = D3D_ROOT_SIGNATURE_VERSION_1_1,
+      .Desc_1_1 = {
+         .NumParameters = ARRAY_SIZE(params),
+         .pParameters = params,
+      },
+   };
+   D3D12_COMPUTE_PIPELINE_STATE_DESC desc = { 0 };
+   VkResult ret = VK_SUCCESS;
+
+   glsl_type_singleton_init_or_ref();
+   nir_shader *nir = dzn_nir_query_reduce_shader();
+   meta->root_sig = dzn_device_create_root_sig(device, &root_desc);
+   if (!meta->root_sig) {
+      ret = vk_error(instance, VK_ERROR_INITIALIZATION_FAILED);
+      goto out;
+   }
+   desc.pRootSignature = meta->root_sig;
+   dzn_meta_compile_shader(device, nir, &desc.CS);
+   if (FAILED(ID3D12Device1_CreateComputePipelineState(
+          device->dev, &desc, &IID_ID3D12PipelineState,
+          (void **)&meta->pipeline_state)))
+      ret = vk_error(instance, VK_ERROR_INITIALIZATION_FAILED);
+
+out:
+   if (ret != VK_SUCCESS)
+      dzn_meta_query_reduce_finish(device);
    free((void *)desc.CS.pShaderBytecode);
    ralloc_free(nir);
    glsl_type_singleton_decref();
@@ -680,8 +798,7 @@ dzn_meta_blit_create(struct dzn_device *device, const struct dzn_meta_blit_key *
    };
    uint32_t num_root_params = 2;
 
-   uint32_t samples = key->resolve_mode == dzn_blit_resolve_none ?
-      key->samples : 1;
+   uint32_t samples = 1u << key->dst_samples_log2;
    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {
       .SampleMask = (1ULL << samples) - 1,
       .RasterizerState = {
@@ -698,7 +815,7 @@ dzn_meta_blit_create(struct dzn_device *device, const struct dzn_meta_blit_key *
    };
 
    struct dzn_nir_blit_info blit_fs_info = {
-      .src_samples = key->samples,
+      .src_samples = 1u << key->src_samples_log2,
       .loc = key->loc,
       .out_type = key->out_type,
       .sampler_dim = key->sampler_dim,
@@ -884,7 +1001,9 @@ dzn_meta_blits_init(struct dzn_device *device)
 void
 dzn_meta_finish(struct dzn_device *device)
 {
+   dzn_meta_raw_image_merge_finish(device);
    dzn_meta_large_point_draw_args_finish(device);
+   dzn_meta_query_reduce_finish(device);
    for (uint32_t i = 0; i < ARRAY_SIZE(device->triangle_fan); i++)
       dzn_meta_triangle_fan_rewrite_index_finish(device, i);
 
@@ -901,6 +1020,16 @@ dzn_meta_init(struct dzn_device *device)
    VkResult result = dzn_meta_blits_init(device);
    if (result != VK_SUCCESS)
       goto out;
+
+   result = dzn_meta_query_reduce_init(device);
+   if (result != VK_SUCCESS)
+      goto out;
+
+   if (dzn_raw_image_lowering_enabled()) {
+      result = dzn_meta_raw_image_merge_init(device);
+      if (result != VK_SUCCESS)
+         goto out;
+   }
 
    result = dzn_meta_large_point_draw_args_init(device);
    if (result != VK_SUCCESS)

@@ -92,6 +92,11 @@ dzn_nir_indirect_draw_shader(struct dzn_indirect_draw_type type);
 /* Convert a D3D12 stream-output filled-size counter (bytes) into the
  * non-indexed indirect draw used by the large-point replay pass. */
 nir_shader *
+dzn_nir_query_reduce_shader(void);
+
+nir_shader *dzn_nir_raw_image_merge_shader(bool reset);
+
+nir_shader *
 dzn_nir_large_point_draw_args_shader(void);
 
 nir_shader *
@@ -178,7 +183,15 @@ nir_shader *
 dzn_nir_polygon_point_mode_gs(const nir_shader *vs, struct dzn_nir_point_gs_info *info);
 
 struct dzn_pipeline_layout;
+bool dzn_nir_lower_raw_images(nir_shader *nir, const struct dzn_pipeline_layout *layout);
+bool dzn_nir_lower_raw_textures(nir_shader *nir, const struct dzn_pipeline_layout *layout);
+
+bool dzn_nir_lower_unformatted_image_loads(nir_shader *nir, const struct dzn_pipeline_layout *layout, bool integer_images);
+
 bool dzn_nir_lower_robust_images(nir_shader *nir, const struct dzn_pipeline_layout *layout,
                                  bool images, bool buffers);
+
+bool dzn_nir_lower_barycentrics(nir_shader *nir, bool sample_rate);
+bool dzn_nir_lower_image_lod(nir_shader *nir);
 
 #endif

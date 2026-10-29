@@ -1,6 +1,8 @@
 #ifndef UWP_UTIL_H
 #define UWP_UTIL_H
 
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -11,11 +13,16 @@ extern "C" {
 #define MESA_UWP_EXPORT
 #endif
 
+int uwp_get_cache_directory(char *path, size_t capacity);
+int uwp_is_desktop_device(void);
 MESA_UWP_EXPORT void* uwp_get_window_reference(void);
 /* A failed COM marshaling request makes the window getter return NULL until
  * the host supplies a new reference. Width/height are published together. */
 MESA_UWP_EXPORT void uwp_set_window_reference(void *window, int width, int height);
 MESA_UWP_EXPORT void mesa_uwp_set_offscreen(int enabled);
+MESA_UWP_EXPORT void mesa_uwp_set_shader_model_limit(unsigned limit);
+MESA_UWP_EXPORT void mesa_uwp_force_legacy_barriers(int enabled);
+MESA_UWP_EXPORT void mesa_uwp_set_raw_image_lowering(int enabled);
 MESA_UWP_EXPORT int mesa_uwp_is_offscreen(void);
 typedef long (__cdecl *mesa_uwp_swapchain_attach_callback)(void *opaque,
                                                            void *swapchain);

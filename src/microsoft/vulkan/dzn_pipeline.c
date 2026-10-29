@@ -41,6 +41,10 @@
 
 #include "util/os_time.h"
 #include "util/u_debug.h"
+#include "vk_common_entrypoints.h"
+#ifdef _XBOX_UWP
+#include "util/uwp_util.h"
+#endif
 
 #ifdef _XBOX_UWP
 static bool dzn_uwp_pso_diagnostic_reported;
@@ -147,7 +151,6 @@ const struct vk_pipeline_cache_object_ops dzn_cached_blob_ops = {
    .destroy = dzn_cached_blob_destroy,
 };
 
-
 static struct vk_pipeline_cache_object *
 dzn_cached_blob_create(struct vk_device *device,
                        const void *hash,
@@ -226,6 +229,505 @@ struct dzn_nir_options {
    const nir_shader_compiler_options *nir_opts;
 };
 
+#define DZN_SUBOBJ_SIZE(id, T) \
+   case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_##id: { \
+      struct dzn_wrap_##id { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; T d; }; \
+      if (off) *off = offsetof(struct dzn_wrap_##id, d); \
+      return sizeof(struct dzn_wrap_##id); }
+static size_t
+dzn_pso_subobject_size(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type, size_t *off)
+{
+   switch (type) {
+   DZN_SUBOBJ_SIZE(ROOT_SIGNATURE, ID3D12RootSignature *)
+   DZN_SUBOBJ_SIZE(VS, D3D12_SHADER_BYTECODE)
+   DZN_SUBOBJ_SIZE(PS, D3D12_SHADER_BYTECODE)
+   DZN_SUBOBJ_SIZE(DS, D3D12_SHADER_BYTECODE)
+   DZN_SUBOBJ_SIZE(HS, D3D12_SHADER_BYTECODE)
+   DZN_SUBOBJ_SIZE(GS, D3D12_SHADER_BYTECODE)
+   DZN_SUBOBJ_SIZE(CS, D3D12_SHADER_BYTECODE)
+   DZN_SUBOBJ_SIZE(STREAM_OUTPUT, D3D12_STREAM_OUTPUT_DESC)
+   DZN_SUBOBJ_SIZE(BLEND, D3D12_BLEND_DESC)
+   DZN_SUBOBJ_SIZE(SAMPLE_MASK, UINT)
+   DZN_SUBOBJ_SIZE(RASTERIZER, D3D12_RASTERIZER_DESC)
+   DZN_SUBOBJ_SIZE(RASTERIZER1, D3D12_RASTERIZER_DESC1)
+   DZN_SUBOBJ_SIZE(RASTERIZER2, D3D12_RASTERIZER_DESC2)
+   DZN_SUBOBJ_SIZE(DEPTH_STENCIL, D3D12_DEPTH_STENCIL_DESC)
+   DZN_SUBOBJ_SIZE(DEPTH_STENCIL1, D3D12_DEPTH_STENCIL_DESC1)
+   DZN_SUBOBJ_SIZE(DEPTH_STENCIL2, D3D12_DEPTH_STENCIL_DESC2)
+   DZN_SUBOBJ_SIZE(INPUT_LAYOUT, D3D12_INPUT_LAYOUT_DESC)
+   DZN_SUBOBJ_SIZE(IB_STRIP_CUT_VALUE, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE)
+   DZN_SUBOBJ_SIZE(PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE)
+   DZN_SUBOBJ_SIZE(RENDER_TARGET_FORMATS, struct D3D12_RT_FORMAT_ARRAY)
+   DZN_SUBOBJ_SIZE(DEPTH_STENCIL_FORMAT, DXGI_FORMAT)
+   DZN_SUBOBJ_SIZE(SAMPLE_DESC, DXGI_SAMPLE_DESC)
+   DZN_SUBOBJ_SIZE(NODE_MASK, UINT)
+   DZN_SUBOBJ_SIZE(CACHED_PSO, D3D12_CACHED_PIPELINE_STATE)
+   DZN_SUBOBJ_SIZE(FLAGS, D3D12_PIPELINE_STATE_FLAGS)
+   DZN_SUBOBJ_SIZE(VIEW_INSTANCING, D3D12_VIEW_INSTANCING_DESC)
+   default: return 0;
+   }
+}
+
+static const GUID dzn_IID_ID3D12PipelineLibrary1 =
+   { 0x80eabf42, 0x2568, 0x4e5e, { 0xbd, 0x82, 0xc3, 0x7f, 0x86, 0x96, 0x1d, 0xc3 } };
+
+static bool
+dzn_pso_stream_hash(const D3D12_PIPELINE_STATE_STREAM_DESC *desc, uint8_t out[BLAKE3_KEY_LEN])
+{
+   struct mesa_blake3 ctx;
+   _mesa_blake3_init(&ctx);
+   const uint8_t *p = (const uint8_t *)desc->pPipelineStateSubobjectStream, *end = p + desc->SizeInBytes;
+   while (p < end) {
+      if ((size_t)(end - p) < sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE))
+         return false;
+      D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = *(const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE *)p;
+      size_t off = 0, sz = dzn_pso_subobject_size(t, &off);
+      if (!sz || ALIGN_POT(sz, sizeof(void *)) > (size_t)(end - p))
+         return false;
+      const uint8_t *d = p + off;
+      p += ALIGN_POT(sz, sizeof(void *));
+      _mesa_blake3_update(&ctx, &t, sizeof(t));
+      switch (t) {
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: {
+         ID3D12RootSignature *rs = *(ID3D12RootSignature *const *)d;
+         uint8_t h[BLAKE3_KEY_LEN];
+         UINT hs = sizeof(h);
+         if (!rs || FAILED(ID3D12RootSignature_GetPrivateData(rs, &dzn_root_sig_hash_guid, &hs, h)) || hs != sizeof(h))
+            return false;
+         _mesa_blake3_update(&ctx, h, sizeof(h));
+         break;
+      }
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS:
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS:
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS:
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS:
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS:
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS: {
+         const D3D12_SHADER_BYTECODE *bc = (const D3D12_SHADER_BYTECODE *)d;
+         uint64_t len = bc->pShaderBytecode ? bc->BytecodeLength : 0;
+         _mesa_blake3_update(&ctx, &len, sizeof(len));
+         if (len)
+            _mesa_blake3_update(&ctx, bc->pShaderBytecode, len);
+         break;
+      }
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT: {
+         const D3D12_INPUT_LAYOUT_DESC *il = (const D3D12_INPUT_LAYOUT_DESC *)d;
+         _mesa_blake3_update(&ctx, &il->NumElements, sizeof(il->NumElements));
+         for (UINT i = 0; i < il->NumElements; i++) {
+            const D3D12_INPUT_ELEMENT_DESC *e = &il->pInputElementDescs[i];
+            const char *sem = e->SemanticName ? e->SemanticName : "";
+            _mesa_blake3_update(&ctx, sem, strlen(sem) + 1);
+            _mesa_blake3_update(&ctx, &e->SemanticIndex, sizeof(*e) - offsetof(D3D12_INPUT_ELEMENT_DESC, SemanticIndex));
+         }
+         break;
+      }
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: {
+         const D3D12_VIEW_INSTANCING_DESC *vi = (const D3D12_VIEW_INSTANCING_DESC *)d;
+         _mesa_blake3_update(&ctx, &vi->ViewInstanceCount, sizeof(vi->ViewInstanceCount));
+         _mesa_blake3_update(&ctx, &vi->Flags, sizeof(vi->Flags));
+         if (vi->pViewInstanceLocations && vi->ViewInstanceCount)
+            _mesa_blake3_update(&ctx, vi->pViewInstanceLocations, vi->ViewInstanceCount * sizeof(*vi->pViewInstanceLocations));
+         break;
+      }
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT: {
+         const D3D12_STREAM_OUTPUT_DESC *so = (const D3D12_STREAM_OUTPUT_DESC *)d;
+         if (so->NumEntries || so->NumStrides)
+            return false;
+         _mesa_blake3_update(&ctx, &so->RasterizedStream, sizeof(so->RasterizedStream));
+         break;
+      }
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO: {
+         const D3D12_CACHED_PIPELINE_STATE *c = (const D3D12_CACHED_PIPELINE_STATE *)d;
+         if (c->pCachedBlob && c->CachedBlobSizeInBytes)
+            return false;
+         break;
+      }
+      default:
+         _mesa_blake3_update(&ctx, d, sz - off);
+         break;
+      }
+   }
+   _mesa_blake3_final(&ctx, out);
+   return true;
+}
+
+HRESULT
+dzn_create_pso(struct dzn_device *device, const D3D12_PIPELINE_STATE_STREAM_DESC *desc,
+               ID3D12PipelineState **out, bool at_draw)
+{
+   WCHAR name[2 * BLAKE3_KEY_LEN + 1];
+   bool named = false;
+   const int64_t start = os_time_get_nano();
+   HRESULT hr;
+
+#ifdef _XBOX_UWP
+   const uint8_t *p = desc->pPipelineStateSubobjectStream;
+   const uint8_t *end = p + desc->SizeInBytes;
+   D3D12_COMPUTE_PIPELINE_STATE_DESC compute = {0};
+   bool is_compute = false;
+   while (p < end) {
+      if ((size_t)(end - p) < sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE))
+         return E_INVALIDARG;
+      D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = *(const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE *)p;
+      size_t off = 0, size = dzn_pso_subobject_size(t, &off);
+      if (!size || ALIGN_POT(size, sizeof(void *)) > (size_t)(end - p))
+         break;
+      if (t == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE)
+         compute.pRootSignature = *(ID3D12RootSignature *const *)(p + off);
+      if (t == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS) {
+         compute.CS = *(const D3D12_SHADER_BYTECODE *)(p + off);
+         is_compute = true;
+      }
+      p += ALIGN_POT(size, sizeof(void *));
+   }
+#endif
+
+   if (device->pso_lib.lib) {
+      uint8_t hash[BLAKE3_KEY_LEN];
+      if (dzn_pso_stream_hash(desc, hash)) {
+         static const char hex[] = "0123456789abcdef";
+         for (unsigned i = 0; i < BLAKE3_KEY_LEN; i++) {
+            name[2 * i] = hex[hash[i] >> 4];
+            name[2 * i + 1] = hex[hash[i] & 15];
+         }
+         name[2 * BLAKE3_KEY_LEN] = 0;
+         named = true;
+
+         simple_mtx_lock(&device->pso_lib.lock);
+#ifdef _XBOX_UWP
+         if (is_compute)
+            hr = ID3D12PipelineLibrary1_LoadComputePipeline(device->pso_lib.lib, name, &compute,
+                                                             &IID_ID3D12PipelineState, (void **)out);
+         else
+#endif
+            hr = ID3D12PipelineLibrary1_LoadPipeline(device->pso_lib.lib, name, desc,
+                                                  &IID_ID3D12PipelineState, (void **)out);
+         simple_mtx_unlock(&device->pso_lib.lock);
+         if (SUCCEEDED(hr)) {
+            p_atomic_inc(&device->pso_lib.loaded);
+            p_atomic_add(&device->pso_lib.load_ns, os_time_get_nano() - start);
+            return hr;
+         }
+         *out = NULL;
+      }
+   }
+
+#ifdef _XBOX_UWP
+   if (is_compute)
+      hr = ID3D12Device4_CreateComputePipelineState(device->dev, &compute, &IID_ID3D12PipelineState, (void **)out);
+   else
+#endif
+      hr = ID3D12Device4_CreatePipelineState(device->dev, desc, &IID_ID3D12PipelineState, (void **)out);
+
+   if (SUCCEEDED(hr) && named) {
+      simple_mtx_lock(&device->pso_lib.lock);
+      HRESULT stored = ID3D12PipelineLibrary1_StorePipeline(device->pso_lib.lib, name, *out);
+      if (SUCCEEDED(stored)) {
+         device->pso_lib.dirty = true;
+         device->pso_lib.generation++;
+      }
+      simple_mtx_unlock(&device->pso_lib.lock);
+   }
+   if (SUCCEEDED(hr)) {
+      p_atomic_inc(&device->pso_lib.compiled);
+      p_atomic_add(&device->pso_lib.compile_ns, os_time_get_nano() - start);
+      if (at_draw)
+         p_atomic_inc(&device->pso_lib.compiled_at_draw);
+   }
+   return hr;
+}
+
+static FILE *
+dzn_pso_lib_open(const char *path, const wchar_t *mode)
+{
+   WCHAR wide[MAX_PATH * 2 + 64];
+   if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, ARRAY_SIZE(wide)))
+      return NULL;
+   return _wfopen(wide, mode);
+}
+
+static void
+dzn_pso_lib_save(struct dzn_device *device)
+{
+   if (!device->pso_lib.lib || FAILED(ID3D12Device_GetDeviceRemovedReason(device->dev)))
+      return;
+
+   simple_mtx_lock(&device->pso_lib.save_lock);
+   simple_mtx_lock(&device->pso_lib.lock);
+   if (!device->pso_lib.dirty) {
+      simple_mtx_unlock(&device->pso_lib.lock);
+      simple_mtx_unlock(&device->pso_lib.save_lock);
+      return;
+   }
+   const uint64_t generation = device->pso_lib.generation;
+   SIZE_T size = ID3D12PipelineLibrary1_GetSerializedSize(device->pso_lib.lib);
+   void *buf = size ? malloc(size) : NULL;
+   HRESULT hr = buf ? ID3D12PipelineLibrary1_Serialize(device->pso_lib.lib, buf, size) : E_OUTOFMEMORY;
+   simple_mtx_unlock(&device->pso_lib.lock);
+   bool ok = false;
+   if (SUCCEEDED(hr)) {
+      char tmp[MAX_PATH * 2 + 64];
+      snprintf(tmp, sizeof(tmp), "%s.%lu.%p.tmp", device->pso_lib.path,
+               (unsigned long)GetCurrentProcessId(), (void *)device);
+      FILE *f = dzn_pso_lib_open(tmp, L"wb");
+      ok = f && fwrite(buf, 1, size, f) == size;
+      if (f)
+         ok = fclose(f) == 0 && ok;
+      WCHAR wtmp[ARRAY_SIZE(tmp)], wpath[MAX_PATH * 2];
+      bool paths_valid = MultiByteToWideChar(CP_UTF8, 0, tmp, -1, wtmp, ARRAY_SIZE(wtmp)) &&
+         MultiByteToWideChar(CP_UTF8, 0, device->pso_lib.path, -1, wpath, ARRAY_SIZE(wpath));
+      ok = ok && paths_valid && MoveFileExW(wtmp, wpath, MOVEFILE_REPLACE_EXISTING);
+      if (!ok && paths_valid)
+         DeleteFileW(wtmp);
+   }
+   free(buf);
+   simple_mtx_lock(&device->pso_lib.lock);
+   if (ok) {
+      if (device->pso_lib.generation == generation)
+         device->pso_lib.dirty = false;
+   } else
+      mesa_logw("dzn: could not persist PSO library to %s", device->pso_lib.path);
+   simple_mtx_unlock(&device->pso_lib.lock);
+   simple_mtx_unlock(&device->pso_lib.save_lock);
+}
+
+void
+dzn_pso_lib_init(struct dzn_device *device)
+{
+   simple_mtx_init(&device->pso_lib.lock, mtx_plain);
+   simple_mtx_init(&device->pso_lib.save_lock, mtx_plain);
+   device->pso_lib.initialized = true;
+
+#ifdef _XBOX_UWP
+   if (!uwp_is_desktop_device()) {
+      mesa_logi("dzn: pipeline libraries disabled on non-desktop UWP devices; using normal PSO creation");
+      return;
+   }
+#endif
+
+   char path[MAX_PATH * 2];
+   DWORD n = GetEnvironmentVariableA("DZN_PSO_LIBRARY", path, sizeof(path));
+   if (n >= sizeof(path))
+      return;
+   if (!n) {
+#ifdef _XBOX_UWP
+      char directory[MAX_PATH * 2];
+      if (!uwp_get_cache_directory(directory, sizeof(directory)))
+         return;
+      int length = snprintf(path, sizeof(path), "%s/mesa-dzn-pso.bin", directory);
+      if (length < 0 || length >= sizeof(path))
+         return;
+#else
+      return;
+#endif
+   }
+
+   D3D12_FEATURE_DATA_SHADER_CACHE cache_caps = { 0 };
+   HRESULT caps_hr = ID3D12Device1_CheckFeatureSupport(device->dev, D3D12_FEATURE_SHADER_CACHE, &cache_caps, sizeof(cache_caps));
+   mesa_logw("dzn: D3D12 shader cache support 0x%x (0x%08x): single PSO %d, library %d, in-process %d, disk %d, driver-managed %d",
+             (unsigned)cache_caps.SupportFlags, (unsigned)caps_hr,
+             !!(cache_caps.SupportFlags & D3D12_SHADER_CACHE_SUPPORT_SINGLE_PSO),
+             !!(cache_caps.SupportFlags & D3D12_SHADER_CACHE_SUPPORT_LIBRARY),
+             !!(cache_caps.SupportFlags & D3D12_SHADER_CACHE_SUPPORT_AUTOMATIC_INPROC_CACHE),
+             !!(cache_caps.SupportFlags & D3D12_SHADER_CACHE_SUPPORT_AUTOMATIC_DISK_CACHE),
+             !!(cache_caps.SupportFlags & D3D12_SHADER_CACHE_SUPPORT_DRIVER_MANAGED_CACHE));
+   if (FAILED(caps_hr) || !(cache_caps.SupportFlags & D3D12_SHADER_CACHE_SUPPORT_LIBRARY)) {
+      mesa_logw("dzn: no D3D12 pipeline library support, not keeping PSOs");
+      return;
+   }
+
+   size_t size = 0;
+   void *blob = NULL;
+   FILE *f = dzn_pso_lib_open(path, L"rb");
+   if (f) {
+      if (_fseeki64(f, 0, SEEK_END) == 0) {
+         int64_t len = _ftelli64(f);
+         if (len > 0 && (uint64_t)len <= SIZE_MAX && _fseeki64(f, 0, SEEK_SET) == 0) {
+            blob = malloc(len);
+            if (blob && fread(blob, 1, len, f) == (size_t)len)
+               size = len;
+         }
+      }
+      fclose(f);
+   }
+
+   ID3D12PipelineLibrary1 *lib = NULL;
+   HRESULT hr = E_FAIL;
+   if (size)
+      hr = ID3D12Device1_CreatePipelineLibrary(device->dev, blob, size, &dzn_IID_ID3D12PipelineLibrary1, (void **)&lib);
+   if (FAILED(hr)) {
+      const HRESULT reason = ID3D12Device_GetDeviceRemovedReason(device->dev);
+      if (FAILED(reason)) {
+         mesa_loge("dzn: device lost while initializing pipeline library: 0x%08x", (unsigned)reason);
+         free(blob);
+         return;
+      }
+      if (size)
+         mesa_logw("dzn: the PSO library in %s can't be used (0x%08x), starting a new one", path, (unsigned)hr);
+      free(blob);
+      blob = NULL;
+      size = 0;
+      lib = NULL;
+      hr = ID3D12Device1_CreatePipelineLibrary(device->dev, NULL, 0, &dzn_IID_ID3D12PipelineLibrary1, (void **)&lib);
+   }
+   if (FAILED(hr) || !lib) {
+      mesa_logw("dzn: PSO libraries are not available (0x%08x)", (unsigned)hr);
+      free(blob);
+      return;
+   }
+
+   device->pso_lib.lib = lib;
+   device->pso_lib.blob = blob;
+   device->pso_lib.path = strdup(path);
+   if (!device->pso_lib.path) {
+      ID3D12PipelineLibrary1_Release(lib);
+      free(blob);
+      device->pso_lib.lib = NULL;
+      device->pso_lib.blob = NULL;
+      return;
+   }
+   mesa_logw("dzn: PSO library %s: %u KB loaded", path, (unsigned)(size >> 10));
+}
+
+void
+dzn_pso_lib_finish(struct dzn_device *device)
+{
+   if (!device->pso_lib.initialized)
+      return;
+   mesa_logi("dzn: PSOs loaded=%u (%.2f ms), compiled=%u (%.2f ms), compiled at draw=%u",
+             device->pso_lib.loaded, device->pso_lib.load_ns / 1e6,
+             device->pso_lib.compiled, device->pso_lib.compile_ns / 1e6,
+             device->pso_lib.compiled_at_draw);
+   if (device->pso_lib.lib) {
+      dzn_pso_lib_save(device);
+      ID3D12PipelineLibrary1_Release(device->pso_lib.lib);
+   }
+   free(device->pso_lib.blob);
+   free(device->pso_lib.path);
+   simple_mtx_destroy(&device->pso_lib.lock);
+   simple_mtx_destroy(&device->pso_lib.save_lock);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+dzn_GetPipelineCacheData(VkDevice _device, VkPipelineCache pipelineCache, size_t *pDataSize, void *pData)
+{
+   VK_FROM_HANDLE(dzn_device, device, _device);
+   VkResult result = vk_common_GetPipelineCacheData(_device, pipelineCache, pDataSize, pData);
+   if (pData)
+      dzn_pso_lib_save(device);
+   return result;
+}
+
+static bool
+dzn_device_lowers_16bit(const struct dzn_device *device)
+{
+   const struct dzn_physical_device *pdev =
+      container_of(device->vk.physical, struct dzn_physical_device, vk);
+
+   return !pdev->options4.Native16BitShaderOpsSupported;
+}
+
+static bool
+dzn_nir_descriptor_depends_on_scalar(nir_scalar value, nir_def *resource, unsigned depth)
+{
+   value = nir_scalar_chase_movs(value);
+   if (value.def == resource)
+      return value.comp == 0;
+   if (!depth)
+      return false;
+   nir_instr *instr = nir_def_instr(value.def);
+   if (instr->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
+         unsigned component = nir_op_infos[alu->op].input_sizes[i] ? 0 : value.comp;
+         if (dzn_nir_descriptor_depends_on_scalar(nir_get_scalar(alu->src[i].src.ssa,
+               alu->src[i].swizzle[component]), resource, depth - 1))
+            return true;
+      }
+   } else if (instr->type == nir_instr_type_intrinsic) {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      if (intr->intrinsic == nir_intrinsic_load_vulkan_descriptor ||
+          intr->intrinsic == nir_intrinsic_vulkan_resource_reindex)
+         return dzn_nir_descriptor_depends_on_scalar(nir_get_scalar(intr->src[0].ssa, value.comp),
+            resource, depth - 1);
+   }
+   return false;
+}
+
+static bool
+dzn_nir_descriptor_depends_on(nir_def *value, nir_def *resource, unsigned depth)
+{
+   return dzn_nir_descriptor_depends_on_scalar(nir_get_scalar(value, 0), resource, depth);
+}
+
+static bool
+dzn_nir_raw_resource_written(nir_shader *nir, nir_def *resource)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            nir_def *descriptor = NULL;
+            if (intr->intrinsic == nir_intrinsic_store_ssbo)
+               descriptor = intr->src[1].ssa;
+            else if (intr->intrinsic == nir_intrinsic_ssbo_atomic ||
+                     intr->intrinsic == nir_intrinsic_ssbo_atomic_swap)
+               descriptor = intr->src[0].ssa;
+            if (descriptor && dzn_nir_descriptor_depends_on(descriptor, resource, 16))
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
+static void
+dzn_pipeline_collect_raw_images(struct dzn_pipeline *pipeline, nir_shader *nir,
+                                 const struct dzn_pipeline_layout *layout)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_vulkan_resource_index)
+               continue;
+            unsigned set = nir_intrinsic_desc_set(intr);
+            if (set < DZN_REGISTER_SPACE_RAW_IMAGES || set >= DZN_REGISTER_SPACE_RAW_IMAGES + MAX_SETS)
+               continue;
+            unsigned binding = nir_intrinsic_binding(intr);
+            struct dzn_raw_image_binding use = {0};
+            use.set = set - DZN_REGISTER_SPACE_RAW_IMAGES;
+            use.binding = binding;
+            const struct dzn_descriptor_set_layout *set_layout = container_of(
+               layout->vk.set_layouts[use.set], struct dzn_descriptor_set_layout, vk);
+            use.write = set_layout->bindings[binding].type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE &&
+                        dzn_nir_raw_resource_written(nir, &intr->def);
+            use.count = set_layout->bindings[binding].descriptor_count *
+                        set_layout->bindings[binding].descriptor_stride;
+            if (nir_src_is_const(intr->src[0])) {
+               use.first = nir_src_as_uint(intr->src[0]);
+               use.count = 1;
+            }
+            bool found = false;
+            util_dynarray_foreach(&pipeline->raw_image_bindings, struct dzn_raw_image_binding, old) {
+               if (old->set == use.set && old->binding == use.binding &&
+                   old->first == use.first && old->count == use.count) {
+                  old->write |= use.write;
+                  found = true;
+                  break;
+               }
+            }
+            if (!found)
+               util_dynarray_append(&pipeline->raw_image_bindings, use);
+         }
+      }
+   }
+}
+
 static VkResult
 dzn_pipeline_get_nir_shader(struct dzn_device *device,
                             const struct dzn_pipeline_layout *layout,
@@ -259,14 +761,54 @@ dzn_pipeline_get_nir_shader(struct dzn_device *device,
       container_of(device->vk.physical, struct dzn_physical_device, vk);
    struct spirv_to_nir_options spirv_opts =
       *dxil_spirv_nir_get_spirv_options();
+   spirv_opts.amd_gcn_shader = device->vk.enabled_extensions.AMD_gcn_shader;
    spirv_opts.amd_trinary_minmax =
       device->vk.enabled_extensions.AMD_shader_trinary_minmax;
+   spirv_opts.amd_shader_explicit_vertex_parameter =
+      device->vk.enabled_extensions.AMD_shader_explicit_vertex_parameter;
+   if (dzn_device_lowers_16bit(device)) {
+      spirv_opts.mediump_16bit_alu = false;
+      spirv_opts.mediump_16bit_derivatives = false;
+   }
 
    VkResult result =
       vk_pipeline_shader_stage_to_nir(&device->vk, pipeline_flags, stage_info,
                                       &spirv_opts, options->nir_opts, NULL, nir);
    if (result != VK_SUCCESS)
       return result;
+
+   if ((*nir)->info.stage == MESA_SHADER_COMPUTE &&
+       !vk_find_struct_const(stage_info->pNext, PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO))
+      (*nir)->info.api_subgroup_size = 0;
+
+   NIR_PASS(_, *nir, dxil_nir_lower_amd_cube);
+   bool volume_images = false;
+   bool unformatted_images = false;
+   bool resized_arrays = false;
+   nir_foreach_variable_with_modes(var, *nir,
+                                  nir_var_uniform | nir_var_image | nir_var_mem_ubo | nir_var_mem_ssbo) {
+      if (!device->bindless && glsl_type_is_array(var->type) && !glsl_get_length(var->type) &&
+          var->data.descriptor_set < layout->vk.set_count &&
+          layout->vk.set_layouts[var->data.descriptor_set]) {
+         const struct dzn_descriptor_set_layout *set_layout = container_of(
+            layout->vk.set_layouts[var->data.descriptor_set], struct dzn_descriptor_set_layout, vk);
+         if (var->data.binding < set_layout->binding_count) {
+            var->type = glsl_array_type(glsl_get_array_element(var->type),
+               set_layout->bindings[var->data.binding].descriptor_count,
+               glsl_get_explicit_stride(var->type));
+            resized_arrays = true;
+         }
+      }
+      const struct glsl_type *type = glsl_without_array(var->type);
+      volume_images |= glsl_type_is_image(type) && glsl_get_sampler_dim(type) == GLSL_SAMPLER_DIM_3D;
+      unformatted_images |= glsl_type_is_image(type) && var->data.image.format == PIPE_FORMAT_NONE;
+   }
+   if (resized_arrays)
+      NIR_PASS(_, *nir, nir_fixup_deref_types);
+
+   NIR_PASS(_, *nir, dzn_nir_lower_barycentrics, options->force_sample_rate_shading);
+   if (device->vk.enabled_extensions.AMD_shader_image_load_store_lod)
+      NIR_PASS(_, *nir, dzn_nir_lower_image_lod);
 
    if (options->patch_vertices)
       NIR_PASS(_, *nir, dzn_nir_lower_patch_vertices, options->patch_vertices);
@@ -277,8 +819,21 @@ dzn_pipeline_get_nir_shader(struct dzn_device *device,
    /* Apply the clip-volume conversion before shared DXIL passes apply any
     * viewport-driven Z reversal to the last rasterization stage.
     */
-   if (options->lower_clip_halfz)
+   if (options->lower_clip_halfz) {
+      NIR_PASS(_, *nir, nir_lower_io_vars_to_temporaries,
+                 nir_shader_get_entrypoint(*nir), nir_var_shader_out);
+      NIR_PASS(_, *nir, nir_split_var_copies);
+      NIR_PASS(_, *nir, nir_lower_var_copies);
       NIR_PASS(_, *nir, nir_lower_clip_halfz);
+   }
+
+   if (device->raw_image_lowering) {
+      NIR_PASS(_, *nir, dzn_nir_lower_raw_images, layout);
+      NIR_PASS(_, *nir, dzn_nir_lower_raw_textures, layout);
+   }
+
+   if (!device->bindless && unformatted_images)
+      NIR_PASS(_, *nir, dzn_nir_lower_unformatted_image_loads, layout, device->integer_image_loads);
 
    bool robust_images = options->robustness.images ==
                             VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS_EXT ||
@@ -311,8 +866,8 @@ dzn_pipeline_get_nir_shader(struct dzn_device *device,
          .y_mask = options->y_flip_mask,
          .z_mask = options->z_flip_mask,
       },
-      .declared_read_only_images_as_srvs = !device->bindless,
-      .inferred_read_only_images_as_srvs = !device->bindless,
+      .declared_read_only_images_as_srvs = !device->bindless && !volume_images && !unformatted_images,
+      .inferred_read_only_images_as_srvs = !device->bindless && !volume_images && !unformatted_images,
       .force_sample_rate_shading = options->force_sample_rate_shading,
       .lower_view_index = options->lower_view_index,
       .lower_view_index_to_rt_layer = options->lower_view_index_to_rt_layer,
@@ -354,6 +909,11 @@ adjust_resource_index_binding(struct nir_builder *builder,
    unsigned set = nir_intrinsic_desc_set(intrin);
    unsigned binding = nir_intrinsic_binding(intrin);
 
+   if (set >= DZN_REGISTER_SPACE_RAW_IMAGES && set < DZN_REGISTER_SPACE_RAW_IMAGES + layout->set_count)
+      set -= DZN_REGISTER_SPACE_RAW_IMAGES;
+   if (set >= DZN_REGISTER_SPACE_INTEGER_IMAGES &&
+       set < DZN_REGISTER_SPACE_INTEGER_IMAGES + layout->set_count)
+      set -= DZN_REGISTER_SPACE_INTEGER_IMAGES;
    if (set >= layout->set_count ||
        binding >= layout->binding_translation[set].binding_count)
       return false;
@@ -410,6 +970,11 @@ adjust_var_bindings(nir_shader *shader,
 
       unsigned s = var->data.descriptor_set, b = var->data.binding;
 
+      if (s >= DZN_REGISTER_SPACE_RAW_IMAGES && s < DZN_REGISTER_SPACE_RAW_IMAGES + layout->set_count)
+         s -= DZN_REGISTER_SPACE_RAW_IMAGES;
+      if (s >= DZN_REGISTER_SPACE_INTEGER_IMAGES &&
+          s < DZN_REGISTER_SPACE_INTEGER_IMAGES + layout->set_count)
+         s -= DZN_REGISTER_SPACE_INTEGER_IMAGES;
       if (s >= layout->set_count)
          continue;
 
@@ -476,11 +1041,8 @@ dzn_pipeline_compile_shader(struct dzn_device *device,
       container_of(device->vk.physical, struct dzn_physical_device, vk);
    struct nir_to_dxil_options opts = {
       .environment = DXIL_ENVIRONMENT_VULKAN,
-      .lower_int16 = !pdev->options4.Native16BitShaderOpsSupported &&
       /* Don't lower 16-bit types if they can only come from min-precision */
-         (device->vk.enabled_extensions.KHR_shader_float16_int8 ||
-          device->vk.enabled_features.shaderFloat16 ||
-          device->vk.enabled_features.shaderInt16),
+      .lower_int16 = dzn_device_lowers_16bit(device),
       .shader_model_max = dzn_pipeline_get_shader_model(pdev,
                                                         nir->info.stage),
       .input_clip_size = input_clip_size,
@@ -667,6 +1229,8 @@ struct dzn_cached_gfx_pipeline_header {
    uint32_t needs_draw_sysvals : 1;
    uint32_t rast_disabled_from_missing_position : 1;
    uint32_t input_count;
+   VkPrimitiveTopology raster_topology;
+   uint32_t raw_binding_count;
 };
 
 static VkResult
@@ -714,7 +1278,26 @@ dzn_pipeline_cache_lookup_gfx_pipeline(struct dzn_graphics_pipeline *pipeline,
       offset += sizeof(*inputs) * info->input_count;
    }
 
-   assert(cached_blob->size == offset + util_bitcount(info->stages) * BLAKE3_KEY_LEN);
+   size_t raw_offset = offset + util_bitcount(info->stages) * BLAKE3_KEY_LEN;
+   if (raw_offset > cached_blob->size ||
+       info->raw_binding_count > (cached_blob->size - raw_offset) / sizeof(struct dzn_raw_image_binding)) {
+      vk_pipeline_cache_object_unref(cache->base.device, cache_obj);
+      return VK_SUCCESS;
+   }
+   size_t raw_bytes = info->raw_binding_count * sizeof(struct dzn_raw_image_binding);
+   if (raw_offset + raw_bytes != cached_blob->size) {
+      vk_pipeline_cache_object_unref(cache->base.device, cache_obj);
+      return VK_SUCCESS;
+   }
+   if (raw_bytes) {
+      void *bindings = util_dynarray_resize(&pipeline->base.raw_image_bindings,
+         struct dzn_raw_image_binding, info->raw_binding_count);
+      if (!bindings) {
+         vk_pipeline_cache_object_unref(cache->base.device, cache_obj);
+         return vk_error(cache->base.device, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+      memcpy(bindings, (char *)cached_blob->data + raw_offset, raw_bytes);
+   }
 
    u_foreach_bit(s, info->stages) {
       uint8_t *dxil_hash = (uint8_t *)cached_blob->data + offset;
@@ -732,6 +1315,7 @@ dzn_pipeline_cache_lookup_gfx_pipeline(struct dzn_graphics_pipeline *pipeline,
       offset += BLAKE3_KEY_LEN;
    }
 
+   pipeline->ia.raster_topology = info->raster_topology;
    pipeline->rast_disabled_from_missing_position = info->rast_disabled_from_missing_position;
    pipeline->needs_draw_sysvals = info->needs_draw_sysvals;
 
@@ -760,8 +1344,9 @@ dzn_pipeline_cache_add_gfx_pipeline(struct dzn_graphics_pipeline *pipeline,
       }
    }
 
+   size_t raw_bytes = pipeline->base.raw_image_bindings.size;
    struct vk_pipeline_cache_object *cache_obj =
-      dzn_cached_blob_create(cache->base.device, pipeline_hash, NULL, offset);
+      dzn_cached_blob_create(cache->base.device, pipeline_hash, NULL, offset + raw_bytes);
    if (!cache_obj)
       return;
 
@@ -772,8 +1357,11 @@ dzn_pipeline_cache_add_gfx_pipeline(struct dzn_graphics_pipeline *pipeline,
    struct dzn_cached_gfx_pipeline_header *info =
       (struct dzn_cached_gfx_pipeline_header *)(cached_blob->data);
 
+   info->raster_topology = pipeline->ia.raster_topology;
    info->input_count = vertex_input_count;
    info->stages = stages;
+   info->raw_binding_count = util_dynarray_num_elements(&pipeline->base.raw_image_bindings,
+      struct dzn_raw_image_binding);
    info->needs_draw_sysvals = pipeline->needs_draw_sysvals;
    info->rast_disabled_from_missing_position = pipeline->rast_disabled_from_missing_position;
 
@@ -791,6 +1379,9 @@ dzn_pipeline_cache_add_gfx_pipeline(struct dzn_graphics_pipeline *pipeline,
       memcpy(dxil_hash, dxil_hashes[s], BLAKE3_KEY_LEN);
       offset += BLAKE3_KEY_LEN;
    }
+
+   if (raw_bytes)
+      memcpy((char *)cached_blob->data + offset, pipeline->base.raw_image_bindings.data, raw_bytes);
 
    cache_obj = vk_pipeline_cache_add_object(cache, cache_obj);
    vk_pipeline_cache_object_unref(cache->base.device, cache_obj);
@@ -854,6 +1445,8 @@ dzn_graphics_pipeline_compile_shaders(struct dzn_device *device,
          vk_to_mesa_shader_stage(info->pStages[i].stage);
 
       assert((unsigned)stage <= MESA_SHADER_FRAGMENT);
+      if (stage == MESA_SHADER_GEOMETRY || stage == MESA_SHADER_TESS_EVAL)
+         pipeline->ia.raster_topology_from_shader = true;
 
       if ((stage == MESA_SHADER_VERTEX ||
            stage == MESA_SHADER_TESS_EVAL ||
@@ -896,7 +1489,7 @@ dzn_graphics_pipeline_compile_shaders(struct dzn_device *device,
       info->pInputAssemblyState->topology != VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
    if (pipeline->use_gs_for_provoking_vertex)
       last_raster_stage = MESA_SHADER_GEOMETRY;
-   const uint32_t provoking_compile_key = 0x50560003u ^
+   const uint32_t provoking_compile_key = 0x50560005u ^
       ((uint32_t)pipeline->provoking_vertex_last << 24) ^
       ((uint32_t)device->vk.enabled_features.provokingVertexLast << 25) ^
       ((uint32_t)info->pInputAssemblyState->topology << 16);
@@ -978,9 +1571,14 @@ dzn_graphics_pipeline_compile_shaders(struct dzn_device *device,
       if (ret != VK_SUCCESS)
          return ret;
 
-      if (cache_hit)
+      if (cache_hit) {
+         pipeline->base.cache_hit = true;
          return VK_SUCCESS;
+      }
    }
+
+   if (pipeline->base.flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR)
+      return VK_PIPELINE_COMPILE_REQUIRED;
 
    /* Second step: get NIR shaders for all stages. */
    nir_shader_compiler_options nir_opts;
@@ -1006,6 +1604,8 @@ dzn_graphics_pipeline_compile_shaders(struct dzn_device *device,
          _mesa_blake3_update(&nir_hash_ctx,
                              &device->vk.enabled_features.robustImageAccess2,
                              sizeof(device->vk.enabled_features.robustImageAccess2));
+         bool lowers_16bit = dzn_device_lowers_16bit(device);
+         _mesa_blake3_update(&nir_hash_ctx, &lowers_16bit, sizeof(lowers_16bit));
          if (stage != MESA_SHADER_FRAGMENT) {
             _mesa_blake3_update(&nir_hash_ctx, &lower_view_index, sizeof(lower_view_index));
             _mesa_blake3_update(&nir_hash_ctx, &force_sample_rate_shading, sizeof(force_sample_rate_shading));
@@ -1052,12 +1652,27 @@ dzn_graphics_pipeline_compile_shaders(struct dzn_device *device,
       if (ret != VK_SUCCESS)
          return ret;
 
+      if (device->raw_image_lowering)
+         dzn_pipeline_collect_raw_images(&pipeline->base, pipeline->templates.shaders[stage].nir, layout);
+
       if (stage == MESA_SHADER_VERTEX)
          pipeline->needs_draw_sysvals = metadata.needs_draw_sysvals;
       pipeline->large_points_expanded |= metadata.lowered_large_points;
    }
 
    nir_shader *domain_shader = pipeline->templates.shaders[MESA_SHADER_TESS_EVAL].nir;
+   pipeline->ia.raster_topology = domain_shader ?
+      domain_shader->info.tess.point_mode ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST :
+      domain_shader->info.tess._primitive_mode == TESS_PRIMITIVE_ISOLINES ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST :
+      VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : pipeline->ia.vk_topology;
+   const nir_shader *geometry_shader = pipeline->templates.shaders[MESA_SHADER_GEOMETRY].nir;
+   if (geometry_shader) {
+      pipeline->ia.raster_topology = pipeline->large_points_expanded ||
+         geometry_shader->info.gs.output_primitive == MESA_PRIM_POINTS ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST :
+         geometry_shader->info.gs.output_primitive == MESA_PRIM_LINE_STRIP ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST :
+         VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+   }
+
    if (domain_shader && domain_origin == VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT)
       domain_shader->info.tess.ccw = !domain_shader->info.tess.ccw;
    if (pipeline->use_gs_for_polygon_mode_point || pipeline->use_gs_for_provoking_vertex ||
@@ -1410,7 +2025,10 @@ dzn_graphics_pipeline_patch_vi_format(VkFormat format)
    case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
    case VK_FORMAT_A2R10G10B10_SSCALED_PACK32:
    case VK_FORMAT_A2R10G10B10_USCALED_PACK32:
+   case VK_FORMAT_A2R10G10B10_SINT_PACK32:
+   case VK_FORMAT_A2R10G10B10_UINT_PACK32:
    case VK_FORMAT_A2B10G10R10_SNORM_PACK32:
+   case VK_FORMAT_A2B10G10R10_SINT_PACK32:
    case VK_FORMAT_A2B10G10R10_SSCALED_PACK32:
    case VK_FORMAT_A2B10G10R10_USCALED_PACK32:
       return VK_FORMAT_R32_UINT;
@@ -1771,6 +2389,8 @@ dzn_graphics_pipeline_translate_ms(struct dzn_graphics_pipeline *pipeline,
    if (!in_ms)
       return;
 
+   pipeline->rasterization_samples = in_ms->rasterizationSamples;
+
    /* TODO: minSampleShading (use VRS), alphaToOneEnable */
    d3d12_gfx_pipeline_state_stream_new_desc(out, SAMPLE_DESC, DXGI_SAMPLE_DESC, desc);
    pipeline->templates.desc_offsets.samples =
@@ -1811,14 +2431,18 @@ translate_stencil_test(struct dzn_graphics_pipeline *pipeline,
    const VkPipelineDepthStencilStateCreateInfo *in_zsa =
       in->pDepthStencilState;
 
+   VkCullModeFlags cull_mode = in->pRasterizationState->cullMode;
+   if (cull_mode == VK_CULL_MODE_FRONT_AND_BACK)
+      cull_mode = VK_CULL_MODE_NONE;
+
    bool front_test_uses_ref =
-      !(in->pRasterizationState->cullMode & VK_CULL_MODE_FRONT_BIT) &&
+      !(cull_mode & VK_CULL_MODE_FRONT_BIT) &&
       in_zsa->front.compareOp != VK_COMPARE_OP_NEVER &&
       in_zsa->front.compareOp != VK_COMPARE_OP_ALWAYS &&
       (pipeline->zsa.stencil_test.dynamic_compare_mask ||
        in_zsa->front.compareMask != 0);
    bool back_test_uses_ref =
-      !(in->pRasterizationState->cullMode & VK_CULL_MODE_BACK_BIT) &&
+      !(cull_mode & VK_CULL_MODE_BACK_BIT) &&
       in_zsa->back.compareOp != VK_COMPARE_OP_NEVER &&
       in_zsa->back.compareOp != VK_COMPARE_OP_ALWAYS &&
       (pipeline->zsa.stencil_test.dynamic_compare_mask ||
@@ -1839,7 +2463,7 @@ translate_stencil_test(struct dzn_graphics_pipeline *pipeline,
       pipeline->zsa.stencil_test.back.compare_mask = 0;
 
    bool back_wr_uses_ref =
-      !(in->pRasterizationState->cullMode & VK_CULL_MODE_BACK_BIT) &&
+      !(cull_mode & VK_CULL_MODE_BACK_BIT) &&
       ((in_zsa->back.compareOp != VK_COMPARE_OP_ALWAYS &&
         in_zsa->back.failOp == VK_STENCIL_OP_REPLACE) ||
        (in_zsa->back.compareOp != VK_COMPARE_OP_NEVER &&
@@ -1849,7 +2473,7 @@ translate_stencil_test(struct dzn_graphics_pipeline *pipeline,
         in_zsa->depthCompareOp != VK_COMPARE_OP_ALWAYS &&
         in_zsa->back.depthFailOp == VK_STENCIL_OP_REPLACE));
    bool front_wr_uses_ref =
-      !(in->pRasterizationState->cullMode & VK_CULL_MODE_FRONT_BIT) &&
+      !(cull_mode & VK_CULL_MODE_FRONT_BIT) &&
       ((in_zsa->front.compareOp != VK_COMPARE_OP_ALWAYS &&
         in_zsa->front.failOp == VK_STENCIL_OP_REPLACE) ||
        (in_zsa->front.compareOp != VK_COMPARE_OP_NEVER &&
@@ -1861,11 +2485,11 @@ translate_stencil_test(struct dzn_graphics_pipeline *pipeline,
 
    pipeline->zsa.stencil_test.front.write_mask =
       (pipeline->zsa.stencil_test.dynamic_write_mask ||
-       (in->pRasterizationState->cullMode & VK_CULL_MODE_FRONT_BIT)) ?
+       (cull_mode & VK_CULL_MODE_FRONT_BIT)) ?
       0 : in_zsa->front.writeMask;
    pipeline->zsa.stencil_test.back.write_mask =
       (pipeline->zsa.stencil_test.dynamic_write_mask ||
-       (in->pRasterizationState->cullMode & VK_CULL_MODE_BACK_BIT)) ?
+       (cull_mode & VK_CULL_MODE_BACK_BIT)) ?
       0 : in_zsa->back.writeMask;
 
    pipeline->zsa.stencil_test.front.uses_ref = front_test_uses_ref || front_wr_uses_ref;
@@ -1897,8 +2521,7 @@ dzn_graphics_pipeline_translate_zsa(struct dzn_device *device,
       in_rast->rasterizerDiscardEnable ? NULL : in->pDepthStencilState;
    const VkPipelineRenderingCreateInfo *ri = vk_find_struct_const(in, PIPELINE_RENDERING_CREATE_INFO);
 
-   if (!in_zsa ||
-       in_rast->cullMode == VK_CULL_MODE_FRONT_AND_BACK) {
+   if (!in_zsa) {
       /* Ensure depth is disabled if the rasterizer should be disabled / everything culled */
       if (pdev->options14.IndependentFrontAndBackStencilRefMaskSupported) {
          d3d12_gfx_pipeline_state_stream_new_desc(out, DEPTH_STENCIL2, D3D12_DEPTH_STENCIL_DESC2, stream_desc);
@@ -1977,6 +2600,20 @@ dzn_graphics_pipeline_translate_zsa(struct dzn_device *device,
       stream_desc->StencilReadMask = desc.FrontFace.StencilReadMask ? desc.FrontFace.StencilReadMask : desc.BackFace.StencilReadMask;
       stream_desc->StencilWriteMask = desc.FrontFace.StencilWriteMask ? desc.FrontFace.StencilWriteMask : desc.BackFace.StencilWriteMask;
    }
+}
+
+static bool
+is_constant_alpha_blend_factor(VkBlendFactor factor)
+{
+   return factor == VK_BLEND_FACTOR_CONSTANT_ALPHA ||
+          factor == VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+}
+
+static bool
+is_constant_color_blend_factor(VkBlendFactor factor)
+{
+   return factor == VK_BLEND_FACTOR_CONSTANT_COLOR ||
+          factor == VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
 }
 
 static D3D12_BLEND
@@ -2077,6 +2714,7 @@ dzn_graphics_pipeline_translate_blend(struct dzn_graphics_pipeline *pipeline,
    struct dzn_physical_device *pdev =
       container_of(device->vk.physical, struct dzn_physical_device, vk);
    bool support_alpha_blend_factor = pdev->options13.AlphaBlendFactorSupported;
+   bool constant_alpha = false, constant_color = false;
 
    d3d12_gfx_pipeline_state_stream_new_desc(out, BLEND, D3D12_BLEND_DESC, desc);
    D3D12_LOGIC_OP logicop =
@@ -2146,10 +2784,20 @@ dzn_graphics_pipeline_translate_blend(struct dzn_graphics_pipeline *pipeline,
             translate_blend_factor(attachment.dstAlphaBlendFactor, true, support_alpha_blend_factor);
          desc->RenderTarget[i].BlendOpAlpha =
             translate_blend_op(attachment.alphaBlendOp);
+
+         const VkPipelineColorBlendAttachmentState *att = &attachment;
+         if (att->blendEnable) {
+            constant_alpha |= is_constant_alpha_blend_factor(att->srcColorBlendFactor) ||
+                              is_constant_alpha_blend_factor(att->dstColorBlendFactor);
+            constant_color |= is_constant_color_blend_factor(att->srcColorBlendFactor) ||
+                              is_constant_color_blend_factor(att->dstColorBlendFactor);
+         }
       }
    }
-}
 
+   pipeline->blend.splat_constant_alpha =
+      !support_alpha_blend_factor && constant_alpha && !constant_color;
+}
 
 static void
 dzn_pipeline_init(struct dzn_pipeline *pipeline,
@@ -2159,6 +2807,7 @@ dzn_pipeline_init(struct dzn_pipeline *pipeline,
                   struct dzn_pipeline_layout *layout,
                   D3D12_PIPELINE_STATE_STREAM_DESC *stream_desc)
 {
+   pipeline->raw_image_bindings = UTIL_DYNARRAY_INIT;
    pipeline->image_metadata_offset = layout->image_metadata_offset;
    pipeline->type = type;
    pipeline->device = device;
@@ -2167,6 +2816,7 @@ dzn_pipeline_init(struct dzn_pipeline *pipeline,
    pipeline->root.sysval_cbv_param_idx = layout->root.sysval_cbv_param_idx;
    pipeline->root.viewport_cbv_param_idx = layout->root.viewport_cbv_param_idx;
    pipeline->root.push_constant_cbv_param_idx = layout->root.push_constant_cbv_param_idx;
+   pipeline->root.push_constant_size = layout->root.push_constant_size;
    pipeline->root.dynamic_buffer_bindless_param_idx = layout->root.dynamic_buffer_bindless_param_idx;
    STATIC_ASSERT(sizeof(pipeline->root.type) == sizeof(layout->root.type));
    memcpy(pipeline->root.type, layout->root.type, sizeof(pipeline->root.type));
@@ -2195,6 +2845,7 @@ dzn_pipeline_init(struct dzn_pipeline *pipeline,
 static void
 dzn_pipeline_finish(struct dzn_pipeline *pipeline)
 {
+   util_dynarray_fini(&pipeline->raw_image_bindings);
    if (pipeline->state)
       ID3D12PipelineState_Release(pipeline->state);
    if (pipeline->root.sig)
@@ -2233,6 +2884,29 @@ dzn_graphics_pipeline_cleanup_dxil_shaders(struct dzn_graphics_pipeline *pipelin
          free((void *)pipeline->templates.shaders[i].bc->pShaderBytecode);
          pipeline->templates.shaders[i].bc = NULL;
       }
+   }
+}
+
+static void
+dzn_pipeline_set_creation_feedback(const void *create_info_next,
+                                   const struct dzn_pipeline *pipeline,
+                                   int64_t start_ns)
+{
+   const VkPipelineCreationFeedbackCreateInfo *info =
+      vk_find_struct_const(create_info_next, PIPELINE_CREATION_FEEDBACK_CREATE_INFO);
+   if (!info)
+      return;
+
+   VkPipelineCreationFeedbackFlags flags = VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT;
+   if (pipeline->cache_hit)
+      flags |= VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT;
+
+   info->pPipelineCreationFeedback->flags = flags;
+   info->pPipelineCreationFeedback->duration = os_time_get_nano() - start_ns;
+
+   for (uint32_t i = 0; i < info->pipelineStageCreationFeedbackCount; i++) {
+      info->pPipelineStageCreationFeedbacks[i].flags = flags;
+      info->pPipelineStageCreationFeedbacks[i].duration = 0;
    }
 }
 
@@ -2298,12 +2972,14 @@ dzn_graphics_pipeline_create(struct dzn_device *device,
         bias_representation->depthBiasExact))
       return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
    D3D12_VIEW_INSTANCE_LOCATION vi_locs[D3D12_MAX_VIEW_INSTANCE_COUNT];
+   int64_t start_ns = os_time_get_nano();
 
    struct dzn_graphics_pipeline *pipeline =
       vk_zalloc2(&device->vk.alloc, pAllocator, sizeof(*pipeline), 8,
                  VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (!pipeline)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+   pipeline->static_cull_mode = pCreateInfo->pRasterizationState->cullMode;
    pipeline->provoking_vertex_last = provoking &&
       provoking->provokingVertexMode == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
 
@@ -2630,9 +3306,7 @@ dzn_graphics_pipeline_create(struct dzn_device *device,
    }
 
    if (!pipeline->variants) {
-      hres = ID3D12Device4_CreatePipelineState(device->dev, stream_desc,
-                                               &IID_ID3D12PipelineState,
-                                               (void **)&pipeline->base.state);
+      hres = dzn_create_pso(device, stream_desc, &pipeline->base.state, false);
       if (FAILED(hres)) {
 #ifdef _XBOX_UWP
          if (!dzn_uwp_pso_diagnostic_reported) {
@@ -2730,10 +3404,12 @@ dzn_graphics_pipeline_create(struct dzn_device *device,
    ret = VK_SUCCESS;
 
 out:
-   if (ret != VK_SUCCESS)
+   if (ret != VK_SUCCESS) {
       dzn_graphics_pipeline_destroy(pipeline, pAllocator);
-   else
+   } else {
+      dzn_pipeline_set_creation_feedback(pCreateInfo->pNext, &pipeline->base, start_ns);
       *out = dzn_graphics_pipeline_to_handle(pipeline);
+   }
 
    return ret;
 }
@@ -2923,8 +3599,7 @@ dzn_update_extended_ds(struct dzn_graphics_pipeline *pipeline,
       ds->BackFace.StencilFunc = dzn_translate_compare_op(state->stencil[1].compare);
    }
    if (pipeline->zsa.ds_fmt == DXGI_FORMAT_UNKNOWN || pipeline->rast_disabled_from_missing_position ||
-       ((dyn & DZN_DYNAMIC_DISCARD) && state->discard) ||
-       ((dyn & DZN_DYNAMIC_CULL) && state->cull_mode == VK_CULL_MODE_FRONT_AND_BACK))
+       ((dyn & DZN_DYNAMIC_DISCARD) && state->discard))
       ds->DepthEnable = ds->StencilEnable = ds->DepthBoundsTestEnable = false;
    if (pipeline->zsa.ds_fmt != DXGI_FORMAT_D24_UNORM_S8_UINT &&
        pipeline->zsa.ds_fmt != DXGI_FORMAT_D32_FLOAT_S8X24_UINT)
@@ -3061,8 +3736,7 @@ dzn_graphics_pipeline_get_state_locked(struct dzn_graphics_pipeline *pipeline,
          if (blend)
             blend->AlphaToCoverageEnable = extended->alpha_to_coverage;
       }
-      if (((dyn & DZN_DYNAMIC_DISCARD) && extended->discard) ||
-          ((dyn & DZN_DYNAMIC_CULL) && extended->cull_mode == VK_CULL_MODE_FRONT_AND_BACK)) {
+      if ((dyn & DZN_DYNAMIC_DISCARD) && extended->discard) {
          D3D12_SHADER_BYTECODE *ps = dzn_graphics_pipeline_get_desc(pipeline, stream_buf, ps);
          if (ps)
             *ps = (D3D12_SHADER_BYTECODE){0};
@@ -3171,9 +3845,7 @@ dzn_graphics_pipeline_get_state_locked(struct dzn_graphics_pipeline *pipeline,
          }
       }
 
-      HRESULT hres = ID3D12Device4_CreatePipelineState(device->dev, &stream_desc,
-                                                                &IID_ID3D12PipelineState,
-                                                                (void**)(&variant->state));
+      HRESULT hres = dzn_create_pso(device, &stream_desc, &variant->state, true);
       free((void *)dynamic_vs.pShaderBytecode);
       if (FAILED(hres)) {
          debug_printf("DZN: dynamic graphics PSO failed HRESULT=0x%08x\n", (unsigned)hres);
@@ -3330,26 +4002,6 @@ dzn_pipeline_creation_feedback_init(
    }
 }
 
-static void
-dzn_pipeline_creation_feedback_finish(
-   const VkPipelineCreationFeedbackCreateInfo *feedback_info,
-   int64_t pipeline_start)
-{
-   if (!feedback_info || !feedback_info->pPipelineCreationFeedback)
-      return;
-
-   /* The application cache stores DXIL shaders, not reusable D3D12 PSOs.
-    * Keep the pipeline-cache-hit bit clear because CreatePipelineState still
-    * creates the native PSO even when every shader came from that cache.
-    * Per-stage feedback is optional; the initialization above reports it as
-    * invalid rather than claiming that shader-cache hits avoided PSO work.
-    */
-   *feedback_info->pPipelineCreationFeedback = (VkPipelineCreationFeedback) {
-      .flags = VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT,
-      .duration = (uint64_t)(os_time_get_nano() - pipeline_start),
-   };
-}
-
 VKAPI_ATTR VkResult VKAPI_CALL
 dzn_CreateGraphicsPipelines(VkDevice dev,
                             VkPipelineCache pipelineCache,
@@ -3369,23 +4021,17 @@ dzn_CreateGraphicsPipelines(VkDevice dev,
    }
 
    for (i = 0; i < count; i++) {
-      const VkPipelineCreationFeedbackCreateInfo *feedback_info =
-         vk_find_struct_const(pCreateInfos[i].pNext,
-                              PIPELINE_CREATION_FEEDBACK_CREATE_INFO);
-      const int64_t pipeline_start = feedback_info ? os_time_get_nano() : 0;
       VkResult pipeline_result = VK_PIPELINE_COMPILE_REQUIRED;
       VkPipelineCreateFlags2KHR flags =
          vk_graphics_pipeline_create_flags(&pCreateInfos[i]);
-      if (!(flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR))
-         pipeline_result = dzn_graphics_pipeline_create(device,
+      pipeline_result = dzn_graphics_pipeline_create(device,
                                                         pipelineCache,
                                                         &pCreateInfos[i],
                                                         pAllocator,
                                                         &pPipelines[i]);
-      if (pipeline_result == VK_SUCCESS)
-         dzn_pipeline_creation_feedback_finish(feedback_info, pipeline_start);
       if (pipeline_result != VK_SUCCESS) {
-         result = pipeline_result;
+         if (result == VK_SUCCESS || result == VK_PIPELINE_COMPILE_REQUIRED)
+            result = pipeline_result;
          pPipelines[i] = VK_NULL_HANDLE;
          if (flags & VK_PIPELINE_CREATE_2_EARLY_RETURN_ON_FAILURE_BIT_KHR)
             break;
@@ -3414,8 +4060,14 @@ dzn_compute_pipeline_destroy(struct dzn_compute_pipeline *pipeline,
    vk_free2(&pipeline->base.base.device->alloc, alloc, pipeline);
 }
 
+struct dzn_cached_compute_pipeline_header {
+   uint8_t dxil_hash[BLAKE3_KEY_LEN];
+   uint32_t raw_binding_count;
+};
+
 static VkResult
-dzn_pipeline_cache_lookup_compute_pipeline(struct vk_pipeline_cache *cache,
+dzn_pipeline_cache_lookup_compute_pipeline(struct dzn_pipeline *pipeline,
+                                           struct vk_pipeline_cache *cache,
                                            uint8_t *pipeline_hash,
                                            D3D12_PIPELINE_STATE_STREAM_DESC *stream_desc,
                                            D3D12_SHADER_BYTECODE *dxil,
@@ -3438,9 +4090,27 @@ dzn_pipeline_cache_lookup_compute_pipeline(struct vk_pipeline_cache *cache,
    struct dzn_cached_blob *cached_blob =
       container_of(cache_obj, struct dzn_cached_blob, base);
 
-   assert(cached_blob->size == BLAKE3_KEY_LEN);
-
-   const uint8_t *dxil_hash = cached_blob->data;
+   if (cached_blob->size < sizeof(struct dzn_cached_compute_pipeline_header)) {
+      vk_pipeline_cache_object_unref(cache->base.device, cache_obj);
+      return VK_SUCCESS;
+   }
+   const struct dzn_cached_compute_pipeline_header *info = (const void *)cached_blob->data;
+   if (info->raw_binding_count > (cached_blob->size - sizeof(*info)) / sizeof(struct dzn_raw_image_binding) ||
+       cached_blob->size != sizeof(*info) + info->raw_binding_count * sizeof(struct dzn_raw_image_binding)) {
+      vk_pipeline_cache_object_unref(cache->base.device, cache_obj);
+      return VK_SUCCESS;
+   }
+   if (info->raw_binding_count) {
+      void *bindings = util_dynarray_resize(&pipeline->raw_image_bindings,
+         struct dzn_raw_image_binding, info->raw_binding_count);
+      if (!bindings) {
+         vk_pipeline_cache_object_unref(cache->base.device, cache_obj);
+         return vk_error(cache->base.device, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+      memcpy(bindings, (char *)cached_blob->data + sizeof(*info),
+         info->raw_binding_count * sizeof(struct dzn_raw_image_binding));
+   }
+   const uint8_t *dxil_hash = info->dxil_hash;
    mesa_shader_stage stage;
 
    VkResult ret =
@@ -3461,19 +4131,27 @@ out:
 }
 
 static void
-dzn_pipeline_cache_add_compute_pipeline(struct vk_pipeline_cache *cache,
+dzn_pipeline_cache_add_compute_pipeline(struct dzn_pipeline *pipeline,
+                                        struct vk_pipeline_cache *cache,
                                         uint8_t *pipeline_hash,
                                         uint8_t *dxil_hash)
 {
    struct vk_pipeline_cache_object *cache_obj =
-      dzn_cached_blob_create(cache->base.device, pipeline_hash, NULL, BLAKE3_KEY_LEN);
+      dzn_cached_blob_create(cache->base.device, pipeline_hash, NULL,
+         sizeof(struct dzn_cached_compute_pipeline_header) + pipeline->raw_image_bindings.size);
    if (!cache_obj)
       return;
 
    struct dzn_cached_blob *cached_blob =
       container_of(cache_obj, struct dzn_cached_blob, base);
 
-   memcpy((void *)cached_blob->data, dxil_hash, BLAKE3_KEY_LEN);
+   struct dzn_cached_compute_pipeline_header *info = (void *)cached_blob->data;
+   memcpy(info->dxil_hash, dxil_hash, BLAKE3_KEY_LEN);
+   info->raw_binding_count = util_dynarray_num_elements(&pipeline->raw_image_bindings,
+      struct dzn_raw_image_binding);
+   if (pipeline->raw_image_bindings.size)
+      memcpy((char *)cached_blob->data + sizeof(*info), pipeline->raw_image_bindings.data,
+         pipeline->raw_image_bindings.size);
 
    cache_obj = vk_pipeline_cache_add_object(cache, cache_obj);
    vk_pipeline_cache_object_unref(cache->base.device, cache_obj);
@@ -3510,11 +4188,17 @@ dzn_compute_pipeline_compile_shader(struct dzn_device *device,
       _mesa_blake3_final(&pipeline_hash_ctx, pipeline_hash);
 
       bool cache_hit = false;
-      ret = dzn_pipeline_cache_lookup_compute_pipeline(cache, pipeline_hash,
+      ret = dzn_pipeline_cache_lookup_compute_pipeline(&pipeline->base, cache, pipeline_hash,
                                                        stream_desc, shader,
                                                        &cache_hit);
+      pipeline->base.cache_hit = cache_hit;
       if (ret != VK_SUCCESS || cache_hit)
          goto out;
+   }
+
+   if (pipeline->base.flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR) {
+      ret = VK_PIPELINE_COMPILE_REQUIRED;
+      goto out;
    }
 
    if (cache) {
@@ -3528,11 +4212,13 @@ dzn_compute_pipeline_compile_shader(struct dzn_device *device,
                           &device->vk.enabled_features.robustImageAccess2,
                           sizeof(device->vk.enabled_features.robustImageAccess2));
       _mesa_blake3_update(&nir_hash_ctx, layout->stages[MESA_SHADER_COMPUTE].hash, BLAKE3_KEY_LEN);
+      bool lowers_16bit = dzn_device_lowers_16bit(device);
+      _mesa_blake3_update(&nir_hash_ctx, &lowers_16bit, sizeof(lowers_16bit));
       _mesa_blake3_update(&nir_hash_ctx, spirv_hash, sizeof(spirv_hash));
       _mesa_blake3_final(&nir_hash_ctx, nir_hash);
    }
    nir_shader_compiler_options nir_opts;
-   const unsigned supported_bit_sizes = 16 | 32 | 64;
+   const unsigned supported_bit_sizes = (pdev->options4.Native16BitShaderOpsSupported ? 16 : 0) | 32 | 64;
    dxil_get_nir_compiler_options(&nir_opts, dzn_get_shader_model(pdev), supported_bit_sizes, supported_bit_sizes);
    struct dzn_nir_options options = {
       .robustness = robustness,
@@ -3545,6 +4231,9 @@ dzn_compute_pipeline_compile_shader(struct dzn_device *device,
                                      &options, &metadata, &nir);
    if (ret != VK_SUCCESS)
       return ret;
+
+   if (device->raw_image_lowering)
+      dzn_pipeline_collect_raw_images(&pipeline->base, nir, layout);
 
    uint8_t bindings_hash[BLAKE3_KEY_LEN], dxil_hash[BLAKE3_KEY_LEN];
 
@@ -3569,7 +4258,7 @@ dzn_compute_pipeline_compile_shader(struct dzn_device *device,
          assert(stage == MESA_SHADER_COMPUTE);
          d3d12_compute_pipeline_state_stream_new_desc(stream_desc, CS, D3D12_SHADER_BYTECODE, cs);
          *cs = *shader;
-         dzn_pipeline_cache_add_compute_pipeline(cache, pipeline_hash, dxil_hash);
+         dzn_pipeline_cache_add_compute_pipeline(&pipeline->base, cache, pipeline_hash, dxil_hash);
          goto out;
       }
    }
@@ -3583,7 +4272,7 @@ dzn_compute_pipeline_compile_shader(struct dzn_device *device,
 
    if (cache) {
       dzn_pipeline_cache_add_dxil_shader(cache, dxil_hash, MESA_SHADER_COMPUTE, shader);
-      dzn_pipeline_cache_add_compute_pipeline(cache, pipeline_hash, dxil_hash);
+      dzn_pipeline_cache_add_compute_pipeline(&pipeline->base, cache, pipeline_hash, dxil_hash);
    }
 
 out:
@@ -3600,6 +4289,7 @@ dzn_compute_pipeline_create(struct dzn_device *device,
 {
    VK_FROM_HANDLE(dzn_pipeline_layout, layout, pCreateInfo->layout);
    VK_FROM_HANDLE(vk_pipeline_cache, pcache, cache);
+   int64_t start_ns = os_time_get_nano();
 
    struct dzn_compute_pipeline *pipeline =
       vk_zalloc2(&device->vk.alloc, pAllocator, sizeof(*pipeline), 8,
@@ -3624,19 +4314,7 @@ dzn_compute_pipeline_create(struct dzn_device *device,
    if (ret != VK_SUCCESS)
       goto out;
 
-#ifdef _XBOX_UWP
-   const D3D12_COMPUTE_PIPELINE_STATE_DESC compute_desc = {
-      .pRootSignature = pipeline->base.root.sig,
-      .CS = shader,
-   };
-   HRESULT pso_hr = ID3D12Device4_CreateComputePipelineState(device->dev, &compute_desc,
-                                                           &IID_ID3D12PipelineState,
-                                                           (void **)&pipeline->base.state);
-#else
-   HRESULT pso_hr = ID3D12Device4_CreatePipelineState(device->dev, &stream_desc,
-                                                     &IID_ID3D12PipelineState,
-                                                     (void **)&pipeline->base.state);
-#endif
+   HRESULT pso_hr = dzn_create_pso(device, &stream_desc, &pipeline->base.state, false);
    if (FAILED(pso_hr)) {
       _debug_printf("Dozen compute PSO creation failed (HRESULT 0x%08x, DXIL %zu bytes)\n",
                     (unsigned)pso_hr, shader.BytecodeLength);
@@ -3648,10 +4326,12 @@ dzn_compute_pipeline_create(struct dzn_device *device,
 
 out:
    free((void *)shader.pShaderBytecode);
-   if (ret != VK_SUCCESS)
+   if (ret != VK_SUCCESS) {
       dzn_compute_pipeline_destroy(pipeline, pAllocator);
-   else
+   } else {
+      dzn_pipeline_set_creation_feedback(pCreateInfo->pNext, &pipeline->base, start_ns);
       *out = dzn_compute_pipeline_to_handle(pipeline);
+   }
 
    return ret;
 }
@@ -3715,23 +4395,17 @@ dzn_CreateComputePipelines(VkDevice dev,
    }
 
    for (i = 0; i < count; i++) {
-      const VkPipelineCreationFeedbackCreateInfo *feedback_info =
-         vk_find_struct_const(pCreateInfos[i].pNext,
-                              PIPELINE_CREATION_FEEDBACK_CREATE_INFO);
-      const int64_t pipeline_start = feedback_info ? os_time_get_nano() : 0;
       VkResult pipeline_result = VK_PIPELINE_COMPILE_REQUIRED;
       VkPipelineCreateFlags2KHR flags =
          vk_compute_pipeline_create_flags(&pCreateInfos[i]);
-      if (!(flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR))
-         pipeline_result = dzn_compute_pipeline_create(device,
+      pipeline_result = dzn_compute_pipeline_create(device,
                                                        pipelineCache,
                                                        &pCreateInfos[i],
                                                        pAllocator,
                                                        &pPipelines[i]);
-      if (pipeline_result == VK_SUCCESS)
-         dzn_pipeline_creation_feedback_finish(feedback_info, pipeline_start);
       if (pipeline_result != VK_SUCCESS) {
-         result = pipeline_result;
+         if (result == VK_SUCCESS || result == VK_PIPELINE_COMPILE_REQUIRED)
+            result = pipeline_result;
          pPipelines[i] = VK_NULL_HANDLE;
          if (flags & VK_PIPELINE_CREATE_2_EARLY_RETURN_ON_FAILURE_BIT_KHR)
             break;

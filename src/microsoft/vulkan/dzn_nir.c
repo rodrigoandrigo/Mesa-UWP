@@ -31,7 +31,9 @@
 #include "spirv_to_dxil.h"
 #include "nir_to_dxil.h"
 #include "nir_builder.h"
+#include "nir_deref.h"
 #include "nir_builtin_builder.h"
+#include "nir_format_convert.h"
 #include "nir_xfb_info.h"
 #include "util/u_dynarray.h"
 #include "dxil_nir.h"
@@ -293,6 +295,95 @@ dzn_nir_indirect_draw_shader(struct dzn_indirect_draw_type type)
    if (type.indirect_count)
       nir_pop_if(&b, NULL);
 
+   return b.shader;
+}
+
+nir_shader *
+dzn_nir_raw_image_merge_shader(bool reset)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+      dxil_get_base_nir_compiler_options(), "dzn_raw_image_%s", reset ? "reset" : "merge");
+   b.shader->info.workgroup_size[0] = 64;
+   b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+   nir_def *params = dzn_nir_create_bo_desc(&b, nir_var_mem_ubo, 0, 0, "params", ACCESS_NON_WRITEABLE);
+   nir_def *raw = dzn_nir_create_bo_desc(&b, nir_var_mem_ssbo, 0, 2, "raw", ACCESS_COHERENT);
+   nir_def *p = nir_load_ubo(&b, 3, 32, params, nir_imm_int(&b, 0),
+      .align_mul = 4, .range_base = 0, .range = 12);
+   nir_def *group = nir_load_workgroup_id(&b);
+   nir_def *group_index = nir_iadd(&b, nir_channel(&b, group, 0),
+      nir_imul_imm(&b, nir_channel(&b, group, 1), 65535));
+   nir_def *id = nir_iadd(&b, nir_imul_imm(&b, group_index, 64),
+      nir_channel(&b, nir_load_local_invocation_id(&b), 0));
+   unsigned block_size = reset ? 4 : 64;
+   nir_def *relative = nir_imul_imm(&b, id, block_size);
+   nir_push_if(&b, nir_ult(&b, relative, nir_channel(&b, p, 1)));
+   if (reset) {
+      nir_store_ssbo(&b, nir_imm_int(&b, 0), raw, nir_iadd(&b, nir_channel(&b, p, 2), relative),
+         .write_mask = 1, .align_mul = 4, .access = ACCESS_COHERENT);
+   } else {
+      nir_def *source = dzn_nir_create_bo_desc(&b, nir_var_mem_ssbo, 0, 1, "native", ACCESS_NON_WRITEABLE);
+      nir_def *address = nir_iadd(&b, nir_channel(&b, p, 0), relative);
+      nir_def *mask_address = nir_iadd(&b, nir_channel(&b, p, 2),
+         nir_imul_imm(&b, nir_ushr_imm(&b, address, 6), 4));
+      nir_def *dirty = nir_load_ssbo(&b, 1, 32, raw, mask_address,
+         .align_mul = 4, .access = ACCESS_COHERENT);
+      for (unsigned i = 0; i < 16; i++) {
+         nir_def *a = nir_iadd_imm(&b, address, i * 4);
+         nir_def *previous = nir_load_ssbo(&b, 1, 32, raw, a, .align_mul = 4, .access = ACCESS_COHERENT);
+         nir_def *native = nir_load_ssbo(&b, 1, 32, source, nir_iadd_imm(&b, relative, i * 4),
+            .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
+         nir_def *lo = nir_bcsel(&b, nir_ine_imm(&b, nir_iand_imm(&b, dirty, 1u << (i * 2)), 0),
+            nir_imm_int(&b, 0xffff), nir_imm_int(&b, 0));
+         nir_def *hi = nir_bcsel(&b, nir_ine_imm(&b, nir_iand_imm(&b, dirty, 2u << (i * 2)), 0),
+            nir_imm_int(&b, 0xffff0000), nir_imm_int(&b, 0));
+         nir_def *mask = nir_ior(&b, lo, hi);
+         nir_def *value = nir_ior(&b, nir_iand(&b, previous, mask), nir_iand(&b, native, nir_inot(&b, mask)));
+         nir_store_ssbo(&b, value, raw, a, .write_mask = 1, .align_mul = 4, .access = ACCESS_COHERENT);
+      }
+      nir_store_ssbo(&b, nir_imm_int(&b, 0), raw, mask_address,
+         .write_mask = 1, .align_mul = 4, .access = ACCESS_COHERENT);
+   }
+   nir_pop_if(&b, NULL);
+   return b.shader;
+}
+
+nir_shader *
+dzn_nir_query_reduce_shader(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+      dxil_get_base_nir_compiler_options(), "dzn_query_reduce");
+   b.shader->info.workgroup_size[0] = 1;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+   nir_def *params = dzn_nir_create_bo_desc(&b, nir_var_mem_ubo, 0, 0, "params", 0);
+   nir_def *src = dzn_nir_create_bo_desc(&b, nir_var_mem_ssbo, 0, 1, "src", ACCESS_NON_WRITEABLE);
+   nir_def *dst = dzn_nir_create_bo_desc(&b, nir_var_mem_ssbo, 0, 2, "dst", ACCESS_NON_READABLE);
+   nir_def *counts = nir_load_ubo(&b, 2, 32, params, nir_imm_int(&b, 0),
+      .align_mul = 4, .range_base = 0, .range = 8);
+   nir_def *offset = nir_imul_imm(&b, nir_channel(&b, nir_load_workgroup_id(&b), 0), 8);
+   nir_def *total = nir_load_ssbo(&b, 2, 32, src, offset,
+      .align_mul = 8, .access = ACCESS_NON_WRITEABLE);
+   nir_variable *value = nir_local_variable_create(b.impl, glsl_uvec_type(2), "value");
+   nir_variable *cursor = nir_local_variable_create(b.impl, glsl_uint_type(), "cursor");
+   nir_store_var(&b, value, total, 3);
+   nir_store_var(&b, cursor, nir_imm_int(&b, 0), 1);
+   nir_push_loop(&b);
+   nir_def *i = nir_load_var(&b, cursor);
+   nir_break_if(&b, nir_uge(&b, i, nir_channel(&b, counts, 1)));
+   nir_def *part_offset = nir_iadd(&b, offset,
+      nir_imul(&b, nir_iadd_imm(&b, i, 1), nir_channel(&b, counts, 0)));
+   nir_def *part = nir_load_ssbo(&b, 2, 32, src, part_offset,
+      .align_mul = 8, .access = ACCESS_NON_WRITEABLE);
+   nir_def *old = nir_load_var(&b, value);
+   nir_def *lo = nir_isub(&b, nir_channel(&b, old, 0), nir_channel(&b, part, 0));
+   nir_def *borrow = nir_b2i32(&b, nir_ult(&b, nir_channel(&b, old, 0), nir_channel(&b, part, 0)));
+   nir_def *hi = nir_isub(&b, nir_isub(&b, nir_channel(&b, old, 1), nir_channel(&b, part, 1)), borrow);
+   nir_store_var(&b, value, nir_vec2(&b, lo, hi), 3);
+   nir_store_var(&b, cursor, nir_iadd_imm(&b, i, 1), 1);
+   nir_pop_loop(&b, NULL);
+   nir_store_ssbo(&b, nir_load_var(&b, value), dst, offset,
+      .write_mask = 3, .access = ACCESS_NON_READABLE, .align_mul = 8);
+   nir_lower_vars_to_ssa(b.shader);
    return b.shader;
 }
 
@@ -912,7 +1003,8 @@ dzn_nir_blit_fs(const struct dzn_nir_blit_info *info)
          tex->coord_components = coord_comps;
 
          tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_ms_index,
-                                           nir_load_sample_id(&b));
+                                           nir_umin(&b, nir_load_sample_id(&b),
+                                                    nir_imm_int(&b, info->src_samples - 1)));
 
          tex->src[2] = nir_tex_src_for_ssa(nir_tex_src_lod,
                                            nir_imm_int(&b, 0));
@@ -1536,12 +1628,14 @@ static nir_def *dzn_nir_image_metadata_descriptor(nir_builder *b)
        0);
 }
 
-static nir_def *dzn_nir_image_defaults(nir_builder *b, nir_deref_instr *deref, unsigned components,
-                                       nir_alu_type type, unsigned bit_size,
+static nir_def *dzn_nir_image_metadata_index(nir_builder *b, nir_deref_instr *deref,
                                        const struct dzn_pipeline_layout *layout)
 {
    nir_variable *var = nir_deref_instr_get_variable(deref);
    uint32_t set = var->data.descriptor_set, binding = var->data.binding;
+   if (set >= DZN_REGISTER_SPACE_INTEGER_IMAGES &&
+       set < DZN_REGISTER_SPACE_INTEGER_IMAGES + layout->set_count)
+      set -= DZN_REGISTER_SPACE_INTEGER_IMAGES;
    assert(set < layout->set_count && binding < layout->binding_translation[set].binding_count);
    uint32_t base = layout->binding_translation[set].image_offsets[binding];
    assert(base != ~0u);
@@ -1553,9 +1647,23 @@ static nir_def *dzn_nir_image_defaults(nir_builder *b, nir_deref_instr *deref, u
          index = nir_iadd(b, index, nir_imul_imm(b, node->arr.index.ssa, stride));
       }
    }
+   return index;
+}
+
+static nir_def *dzn_nir_image_metadata(nir_builder *b, nir_deref_instr *deref,
+                                      const struct dzn_pipeline_layout *layout)
+{
+   nir_def *index = dzn_nir_image_metadata_index(b, deref, layout);
    nir_def *descriptor = dzn_nir_image_metadata_descriptor(b);
-   nir_def *mask = nir_load_ssbo(b, 1, 32, descriptor, nir_imul_imm(b, index, 4), .align_mul = 4,
+   return nir_load_ssbo(b, 1, 32, descriptor, nir_imul_imm(b, index, 4), .align_mul = 4,
                                  .access = ACCESS_NON_WRITEABLE);
+}
+
+static nir_def *dzn_nir_image_defaults(nir_builder *b, nir_deref_instr *deref, unsigned components,
+                                       nir_alu_type type, unsigned bit_size,
+                                       const struct dzn_pipeline_layout *layout)
+{
+   nir_def *mask = dzn_nir_image_metadata(b, deref, layout);
    nir_def *zero = nir_imm_zero(b, 1, bit_size);
    nir_def *one = nir_alu_type_get_base_type(type) == nir_type_float
                       ? nir_imm_floatN_t(b, 1, bit_size)
@@ -1565,6 +1673,705 @@ static nir_def *dzn_nir_image_defaults(nir_builder *b, nir_deref_instr *deref, u
       values[c] =
           nir_bcsel(b, nir_ine_imm(b, nir_iand_imm(b, mask, BITFIELD_BIT(c)), 0), one, zero);
    return nir_vec(b, values, components);
+}
+
+static const struct glsl_type *
+dzn_integer_image_type(const struct glsl_type *type)
+{
+   if (glsl_type_is_array(type))
+      return glsl_array_type(dzn_integer_image_type(glsl_get_array_element(type)),
+                             glsl_get_length(type), glsl_get_explicit_stride(type));
+   return glsl_image_type(glsl_get_sampler_dim(type), glsl_sampler_type_is_array(type), GLSL_TYPE_UINT);
+}
+
+static nir_deref_instr *
+dzn_nir_integer_image_deref(nir_builder *b, nir_deref_instr *deref)
+{
+   nir_variable *var = nir_deref_instr_get_variable(deref);
+   unsigned set = DZN_REGISTER_SPACE_INTEGER_IMAGES + var->data.descriptor_set;
+   nir_variable *integer = NULL;
+   nir_foreach_variable_with_modes(candidate, b->shader, nir_var_image) {
+      if (candidate->data.descriptor_set == set && candidate->data.binding == var->data.binding &&
+          candidate->type == dzn_integer_image_type(var->type)) {
+         integer = candidate;
+         break;
+      }
+   }
+   if (!integer) {
+      integer = nir_variable_clone(var, b->shader);
+      integer->data.descriptor_set = set;
+      integer->data.image.format = PIPE_FORMAT_R32G32B32A32_UINT;
+      integer->type = dzn_integer_image_type(var->type);
+      integer->data.access = (var->data.access | ACCESS_COHERENT) & ~ACCESS_NON_READABLE;
+      nir_shader_add_variable(b->shader, integer);
+   }
+   var->data.access |= ACCESS_COHERENT;
+   nir_deref_path path;
+   nir_deref_path_init(&path, deref, NULL);
+   nir_deref_instr *result = nir_build_deref_var(b, integer);
+   for (unsigned i = 1; path.path[i]; i++)
+      result = nir_build_deref_array(b, result, path.path[i]->arr.index.ssa);
+   nir_deref_path_finish(&path);
+   return result;
+}
+
+static const enum pipe_format dzn_raw_pipe_formats[] = {
+   PIPE_FORMAT_R8G8_UNORM, PIPE_FORMAT_R8G8_SNORM, PIPE_FORMAT_R16G16_FLOAT,
+   PIPE_FORMAT_R32G32_FLOAT, PIPE_FORMAT_R10G10B10A2_UNORM, PIPE_FORMAT_R11G11B10_FLOAT,
+};
+
+static nir_def *
+dzn_nir_raw_buffer(nir_builder *b, nir_deref_instr *deref, bool store)
+{
+   nir_variable *image = nir_deref_instr_get_variable(deref);
+   unsigned set = DZN_REGISTER_SPACE_RAW_IMAGES + image->data.descriptor_set;
+   bool declared = false;
+   nir_foreach_variable_with_modes(var, b->shader, nir_var_mem_ssbo) {
+      if (var->data.descriptor_set == set && var->data.binding == image->data.binding) {
+         declared = true;
+         if (store)
+            var->data.access &= ~ACCESS_NON_WRITEABLE;
+      }
+   }
+   if (!declared) {
+      struct glsl_struct_field field = {.type = glsl_uint_type(), .name = "word"};
+      const struct glsl_type *type = glsl_struct_type(&field, 1, "raw_image", false);
+      if (glsl_type_is_array(image->type))
+         type = glsl_array_type(type, glsl_get_aoa_size(image->type), 0);
+      nir_variable *var = nir_variable_create(b->shader, nir_var_mem_ssbo, type, "raw_image");
+      var->data.descriptor_set = set;
+      var->data.binding = image->data.binding;
+      var->data.access = ACCESS_COHERENT;
+      b->shader->info.num_ssbos++;
+   }
+   nir_def *element = nir_imm_int(b, 0);
+   for (nir_deref_instr *node = deref; node->deref_type != nir_deref_type_var;
+        node = nir_deref_instr_parent(node)) {
+      if (node->deref_type == nir_deref_type_array) {
+         unsigned stride = glsl_type_is_array(node->type) ? glsl_get_aoa_size(node->type) : 1;
+         element = nir_iadd(b, element, nir_imul_imm(b, node->arr.index.ssa, stride));
+      }
+   }
+   nir_def *index = nir_vulkan_resource_index(b, 2, 32, element,
+      .desc_set = set, .binding = image->data.binding, .desc_type = nir_descriptor_type_storage_buffer);
+   return nir_channel(b, nir_load_vulkan_descriptor(b, 2, 32, index,
+      .desc_type = nir_descriptor_type_storage_buffer), 0);
+}
+
+static nir_def *
+dzn_nir_pack_unsigned_float(nir_builder *b, nir_def *value, unsigned mantissa_bits)
+{
+   nir_def *exponent = nir_iand_imm(b, nir_ushr_imm(b, value, 23), 255);
+   nir_def *fraction = nir_iand_imm(b, value, 0x7fffff);
+   unsigned shift = 23 - mantissa_bits;
+   nir_def *rounded = nir_ushr_imm(b, nir_iadd(b, fraction,
+      nir_iadd_imm(b, nir_iand_imm(b, nir_ushr_imm(b, fraction, shift), 1), (1u << (shift - 1)) - 1)), shift);
+   nir_def *normal = nir_iadd(b, nir_ishl_imm(b, nir_iadd_imm(b, exponent, -112), mantissa_bits), rounded);
+   normal = nir_umin(b, normal, nir_imm_int(b, 31u << mantissa_bits));
+   nir_def *sub_shift = nir_isub(b, nir_imm_int(b, 113 + shift), exponent);
+   nir_def *safe_shift = nir_umin(b, nir_umax(b, sub_shift, nir_imm_int(b, 1)), nir_imm_int(b, 31));
+   nir_def *significand = nir_ior_imm(b, fraction, 0x800000);
+   nir_def *truncated = nir_ushr(b, significand, safe_shift);
+   nir_def *half = nir_ishl(b, nir_imm_int(b, 1), nir_iadd_imm(b, safe_shift, -1));
+   nir_def *remainder = nir_iand(b, significand, nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), safe_shift), -1));
+   nir_def *increment = nir_ior(b, nir_ult(b, half, remainder),
+      nir_iand(b, nir_ieq(b, half, remainder), nir_ine_imm(b, nir_iand_imm(b, truncated, 1), 0)));
+   nir_def *subnormal = nir_iadd(b, truncated, nir_b2i32(b, increment));
+   subnormal = nir_bcsel(b, nir_ult(b, sub_shift, nir_imm_int(b, 32)), subnormal, nir_imm_int(b, 0));
+   nir_def *finite = nir_bcsel(b, nir_ult(b, exponent, nir_imm_int(b, 113)), subnormal, normal);
+   finite = nir_bcsel(b, nir_uge(b, exponent, nir_imm_int(b, 143)),
+      nir_imm_int(b, 31u << mantissa_bits), finite);
+   finite = nir_bcsel(b, nir_ine_imm(b, nir_iand_imm(b, value, 0x80000000), 0), nir_imm_int(b, 0), finite);
+   nir_def *special = nir_ior(b, nir_imm_int(b, 31u << mantissa_bits),
+      nir_bcsel(b, nir_ine_imm(b, fraction, 0), nir_imm_int(b, 1u << (mantissa_bits - 1)), nir_imm_int(b, 0)));
+   special = nir_bcsel(b, nir_ine_imm(b, fraction, 0), special, finite);
+   return nir_bcsel(b, nir_ieq_imm(b, exponent, 255), special, finite);
+}
+
+static nir_def *
+dzn_nir_raw_decode(nir_builder *b, nir_def *code, nir_def *words)
+{
+   nir_def *value = nir_imm_vec4(b, 0, 0, 0, 1);
+   for (unsigned i = 0; i < ARRAY_SIZE(dzn_raw_pipe_formats); i++) {
+      nir_def *packed = i == 3 ? words : nir_channel(b, words, 0);
+      nir_def *decoded = nir_format_unpack_rgba(b, packed, dzn_raw_pipe_formats[i]);
+      value = nir_bcsel(b, nir_ieq_imm(b, code, i + 1), decoded, value);
+   }
+   return value;
+}
+
+static nir_def *
+dzn_nir_raw_encode(nir_builder *b, nir_def *code, nir_def *value)
+{
+   nir_def *words = nir_imm_ivec2(b, 0, 0);
+   for (unsigned i = 0; i < ARRAY_SIZE(dzn_raw_pipe_formats); i++) {
+      nir_def *packed;
+      if (i == 5) {
+         packed = nir_ior(b, dzn_nir_pack_unsigned_float(b, nir_channel(b, value, 0), 6),
+            nir_ior(b, nir_ishl_imm(b, dzn_nir_pack_unsigned_float(b, nir_channel(b, value, 1), 6), 11),
+               nir_ishl_imm(b, dzn_nir_pack_unsigned_float(b, nir_channel(b, value, 2), 5), 22)));
+      } else {
+         packed = nir_format_pack_rgba(b, dzn_raw_pipe_formats[i], value);
+      }
+      nir_def *pair = i == 3 ? packed : nir_vec2(b, nir_channel(b, packed, 0), nir_imm_int(b, 0));
+      words = nir_bcsel(b, nir_ieq_imm(b, code, i + 1), pair, words);
+   }
+   return words;
+}
+
+static void
+dzn_nir_raw_store(nir_builder *b, nir_def *descriptor, nir_def *address,
+                   nir_def *code, nir_def *value, unsigned access)
+{
+   nir_def *words = dzn_nir_raw_encode(b, code, value);
+   nir_push_if(b, nir_ult(b, code, nir_imm_int(b, 3)));
+   nir_def *aligned = nir_iand_imm(b, address, ~3u);
+   nir_def *shift = nir_imul_imm(b, nir_iand_imm(b, address, 3), 8);
+   nir_def *mask = nir_ishl(b, nir_imm_int(b, 0xffff), shift);
+   nir_variable *expected = nir_local_variable_create(nir_shader_get_entrypoint(b->shader), glsl_uint_type(), "raw_word");
+   nir_store_var(b, expected, nir_load_ssbo(b, 1, 32, descriptor, aligned,
+      .align_mul = 4, .access = access), 1);
+   nir_push_loop(b);
+   nir_def *before = nir_load_var(b, expected);
+   nir_def *after = nir_ior(b, nir_iand(b, before, nir_inot(b, mask)),
+      nir_ishl(b, nir_iand_imm(b, nir_channel(b, words, 0), 0xffff), shift));
+   nir_def *observed = nir_ssbo_atomic_swap(b, 32, descriptor, aligned, before, after,
+      .atomic_op = nir_atomic_op_cmpxchg, .access = access);
+   nir_push_if(b, nir_ieq(b, observed, before));
+   nir_jump(b, nir_jump_break);
+   nir_pop_if(b, NULL);
+   nir_store_var(b, expected, observed, 1);
+   nir_pop_loop(b, NULL);
+   nir_push_else(b, NULL);
+   nir_push_if(b, nir_ieq_imm(b, code, 4));
+   nir_store_ssbo(b, words, descriptor, address, .write_mask = 3, .align_mul = 4, .access = access);
+   nir_push_else(b, NULL);
+   nir_store_ssbo(b, nir_channel(b, words, 0), descriptor, address, .write_mask = 1, .align_mul = 4, .access = access);
+   nir_pop_if(b, NULL);
+   nir_pop_if(b, NULL);
+}
+
+static bool
+dzn_nir_raw_image_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic == nir_intrinsic_barrier) {
+      nir_variable_mode modes = nir_intrinsic_memory_modes(intr);
+      if (modes & nir_var_image) {
+         nir_intrinsic_set_memory_modes(intr, modes | nir_var_mem_ssbo);
+         return true;
+      }
+      return false;
+   }
+   bool store = intr->intrinsic == nir_intrinsic_image_deref_store;
+   if (!store && intr->intrinsic != nir_intrinsic_image_deref_load)
+      return false;
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   nir_variable *var = nir_deref_instr_get_variable(deref);
+   const struct glsl_type *type = glsl_without_array(var->type);
+   enum glsl_sampler_dim dim = glsl_get_sampler_dim(type);
+   if (glsl_get_sampler_result_type(type) != GLSL_TYPE_FLOAT ||
+       dim == GLSL_SAMPLER_DIM_BUF || dim == GLSL_SAMPLER_DIM_MS)
+      return false;
+   if (var->data.image.format != PIPE_FORMAT_NONE) {
+      bool raw_format = false;
+      for (unsigned i = 0; i < ARRAY_SIZE(dzn_raw_pipe_formats); i++)
+         raw_format |= var->data.image.format == dzn_raw_pipe_formats[i];
+      if (!raw_format)
+         return false;
+   }
+   const struct dzn_pipeline_layout *layout = data;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *index = dzn_nir_image_metadata_index(b, deref, layout);
+   nir_def *metadata = dzn_nir_image_metadata_descriptor(b);
+   nir_def *base = nir_iadd_imm(b, nir_imul_imm(b, index, sizeof(struct dzn_raw_image_metadata)),
+      layout->image_metadata_offset * sizeof(uint32_t));
+   nir_def *first = nir_load_ssbo(b, 4, 32, metadata, base, .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
+   nir_def *shape = nir_load_ssbo(b, 4, 32, metadata, nir_iadd_imm(b, base, 16),
+      .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
+   nir_def *code = nir_channel(b, first, 0);
+   nir_push_if(b, nir_ine_imm(b, code, 0));
+   nir_def *coords = intr->src[1].ssa;
+   nir_def *x = nir_channel(b, coords, 0);
+   nir_def *y = dim == GLSL_SAMPLER_DIM_1D ? nir_imm_int(b, 0) : nir_channel(b, coords, 1);
+   nir_def *z = dim == GLSL_SAMPLER_DIM_1D ?
+      (glsl_sampler_type_is_array(type) ? nir_channel(b, coords, 1) : nir_imm_int(b, 0)) :
+      (dim == GLSL_SAMPLER_DIM_3D || dim == GLSL_SAMPLER_DIM_CUBE || glsl_sampler_type_is_array(type) ?
+         nir_channel(b, coords, 2) : nir_imm_int(b, 0));
+   nir_def *valid = nir_iand(b, nir_ult(b, x, nir_channel(b, shape, 0)),
+      nir_iand(b, nir_ult(b, y, nir_channel(b, shape, 1)), nir_ult(b, z, nir_channel(b, shape, 2))));
+   nir_def *bytes = nir_bcsel(b, nir_ult(b, code, nir_imm_int(b, 3)), nir_imm_int(b, 2),
+      nir_bcsel(b, nir_ieq_imm(b, code, 4), nir_imm_int(b, 8), nir_imm_int(b, 4)));
+   nir_def *address = nir_iadd(b, nir_channel(b, first, 1),
+      nir_iadd(b, nir_imul(b, x, bytes), nir_iadd(b,
+         nir_imul(b, y, nir_channel(b, first, 2)), nir_imul(b, z, nir_channel(b, first, 3)))));
+   nir_def *descriptor = dzn_nir_raw_buffer(b, deref, store);
+   unsigned access = (nir_intrinsic_access(intr) | ACCESS_COHERENT) &
+      ~(ACCESS_NON_READABLE | ACCESS_NON_WRITEABLE);
+   nir_def *result = NULL;
+   nir_push_if(b, valid);
+   if (store) {
+      dzn_nir_raw_store(b, descriptor, address, code, intr->src[3].ssa, access);
+      nir_def *bit = nir_iand_imm(b, nir_ushr_imm(b, address, 1), 31);
+      nir_def *bits = nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), nir_ushr_imm(b, bytes, 1)), -1);
+      nir_def *dirty_address = nir_iadd(b, nir_channel(b, shape, 3),
+         nir_imul_imm(b, nir_ushr_imm(b, address, 6), 4));
+      nir_ssbo_atomic(b, 32, descriptor, dirty_address, nir_ishl(b, bits, bit),
+         .atomic_op = nir_atomic_op_ior, .access = access);
+   } else {
+      nir_def *word = nir_load_ssbo(b, 1, 32, descriptor, nir_iand_imm(b, address, ~3u),
+         .align_mul = 4, .access = access);
+      nir_def *shift = nir_imul_imm(b, nir_iand_imm(b, address, 3), 8);
+      word = nir_ushr(b, word, shift);
+      nir_push_if(b, nir_ieq_imm(b, code, 4));
+      nir_def *second = nir_load_ssbo(b, 1, 32, descriptor, nir_iadd_imm(b, address, 4),
+         .align_mul = 4, .access = access);
+      nir_push_else(b, NULL);
+      nir_def *zero = nir_imm_int(b, 0);
+      nir_pop_if(b, NULL);
+      second = nir_if_phi(b, second, zero);
+      result = dzn_nir_raw_decode(b, code, nir_vec2(b, word, second));
+   }
+   nir_push_else(b, NULL);
+   nir_def *invalid = store ? NULL : nir_imm_zero(b, 4, 32);
+   nir_pop_if(b, NULL);
+   if (!store)
+      result = nir_trim_vector(b, nir_if_phi(b, result, invalid), intr->def.num_components);
+   nir_push_else(b, NULL);
+   nir_intrinsic_instr *native = nir_instr_as_intrinsic(nir_instr_clone(b->shader, &intr->instr));
+   nir_builder_instr_insert(b, &native->instr);
+   nir_pop_if(b, NULL);
+   if (!store) {
+      result = nir_if_phi(b, result, &native->def);
+      nir_def_rewrite_uses(&intr->def, result);
+   }
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
+bool
+dzn_nir_lower_raw_images(nir_shader *nir, const struct dzn_pipeline_layout *layout)
+{
+   return nir_shader_intrinsics_pass(nir, dzn_nir_raw_image_instr, nir_metadata_none, (void *)layout);
+}
+
+struct dzn_raw_texture_state {
+   nir_def *metadata, *base, *code, *buffer, *levels, *mapping, *min_lod;
+};
+
+struct dzn_raw_sampler_state {
+   nir_def *filter, *u, *v, *unnormalized, *anisotropy, *bias, *min_lod, *max_lod, *border;
+};
+
+static nir_def *
+dzn_raw_metadata_load(nir_builder *b, const struct dzn_raw_texture_state *t, unsigned offset, unsigned count)
+{
+   return nir_load_ssbo(b, count, 32, t->metadata, nir_iadd_imm(b, t->base, offset),
+      .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
+}
+
+static void
+dzn_raw_texture_mip(nir_builder *b, const struct dzn_raw_texture_state *t, nir_def *level,
+                     nir_def **layout, nir_def **shape)
+{
+   nir_def *safe = nir_umin(b, level, nir_imm_int(b, DZN_RAW_IMAGE_MIP_COUNT - 1));
+   nir_def *offset = nir_iadd_imm(b, nir_iadd(b, t->base,
+      nir_imul_imm(b, safe, sizeof(struct dzn_raw_mip_metadata))), offsetof(struct dzn_raw_image_metadata, mips));
+   *layout = nir_load_ssbo(b, 4, 32, t->metadata, offset, .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
+   *shape = nir_load_ssbo(b, 2, 32, t->metadata, nir_iadd_imm(b, offset, 16),
+      .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
+}
+
+static nir_def *
+dzn_raw_texture_mapping(nir_builder *b, const struct dzn_raw_texture_state *t, nir_def *color)
+{
+   nir_def *components[4];
+   for (unsigned c = 0; c < 4; c++) {
+      nir_def *source = nir_iand_imm(b, nir_ushr_imm(b, t->mapping, c * 3), 7);
+      components[c] = nir_bcsel(b, nir_ieq_imm(b, source, 5), nir_imm_float(b, 1), nir_imm_float(b, 0));
+      for (unsigned s = 0; s < 4; s++)
+         components[c] = nir_bcsel(b, nir_ieq_imm(b, source, s), nir_channel(b, color, s), components[c]);
+   }
+   return nir_vec(b, components, 4);
+}
+
+static nir_def *
+dzn_raw_texture_fetch(nir_builder *b, const struct dzn_raw_texture_state *t, nir_def *level,
+                       nir_def *x, nir_def *y, nir_def *layer)
+{
+   nir_def *layout, *shape;
+   dzn_raw_texture_mip(b, t, level, &layout, &shape);
+   nir_def *valid = nir_iand(b, nir_ult(b, level, t->levels),
+      nir_iand(b, nir_ult(b, x, nir_channel(b, layout, 3)),
+         nir_iand(b, nir_ult(b, y, nir_channel(b, shape, 0)), nir_ult(b, layer, nir_channel(b, shape, 1)))));
+   valid = nir_iand(b, valid, nir_uge(b, level, nir_f2u32(b, nir_ffloor(b, t->min_lod))));
+   nir_push_if(b, valid);
+   nir_def *bytes = nir_bcsel(b, nir_ult(b, t->code, nir_imm_int(b, 3)), nir_imm_int(b, 2),
+      nir_bcsel(b, nir_ieq_imm(b, t->code, 4), nir_imm_int(b, 8), nir_imm_int(b, 4)));
+   nir_def *address = nir_iadd(b, nir_channel(b, layout, 0), nir_iadd(b,
+      nir_imul(b, x, bytes), nir_iadd(b, nir_imul(b, y, nir_channel(b, layout, 1)),
+         nir_imul(b, layer, nir_channel(b, layout, 2)))));
+   nir_def *lo = nir_load_ssbo(b, 1, 32, t->buffer, nir_iand_imm(b, address, ~3u),
+      .align_mul = 4, .access = ACCESS_COHERENT);
+   lo = nir_ushr(b, lo, nir_imul_imm(b, nir_iand_imm(b, address, 3), 8));
+   nir_push_if(b, nir_ieq_imm(b, t->code, 4));
+   nir_def *hi = nir_load_ssbo(b, 1, 32, t->buffer, nir_iadd_imm(b, address, 4),
+      .align_mul = 4, .access = ACCESS_COHERENT);
+   nir_push_else(b, NULL);
+   nir_def *zero = nir_imm_int(b, 0);
+   nir_pop_if(b, NULL);
+   hi = nir_if_phi(b, hi, zero);
+   nir_def *color = dzn_raw_texture_mapping(b, t, dzn_nir_raw_decode(b, t->code, nir_vec2(b, lo, hi)));
+   nir_push_else(b, NULL);
+   nir_def *invalid = nir_imm_zero(b, 4, 32);
+   nir_pop_if(b, NULL);
+   return nir_if_phi(b, color, invalid);
+}
+
+static nir_def *
+dzn_raw_address(nir_builder *b, nir_def *p, nir_def *size, nir_def *mode, nir_def **valid)
+{
+   nir_def *wrapped = nir_imod(b, p, size);
+   wrapped = nir_bcsel(b, nir_ilt_imm(b, wrapped, 0), nir_iadd(b, wrapped, size), wrapped);
+   nir_def *period = nir_imul_imm(b, size, 2);
+   nir_def *mirror = nir_imod(b, p, period);
+   mirror = nir_bcsel(b, nir_ilt_imm(b, mirror, 0), nir_iadd(b, mirror, period), mirror);
+   mirror = nir_bcsel(b, nir_ult(b, mirror, size), mirror, nir_iadd_imm(b, nir_isub(b, period, mirror), -1));
+   nir_def *once = nir_bcsel(b, nir_ilt_imm(b, p, 0), nir_iadd_imm(b, nir_ineg(b, p), -1), p);
+   nir_def *edge = nir_imin(b, nir_imax(b, p, nir_imm_int(b, 0)), nir_iadd_imm(b, size, -1));
+   once = nir_imin(b, once, nir_iadd_imm(b, size, -1));
+   nir_def *result = nir_bcsel(b, nir_ieq_imm(b, mode, D3D12_TEXTURE_ADDRESS_MODE_WRAP), wrapped, edge);
+   result = nir_bcsel(b, nir_ieq_imm(b, mode, D3D12_TEXTURE_ADDRESS_MODE_MIRROR), mirror, result);
+   result = nir_bcsel(b, nir_ieq_imm(b, mode, D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE), once, result);
+   *valid = nir_ior(b, nir_ine_imm(b, mode, D3D12_TEXTURE_ADDRESS_MODE_BORDER), nir_ult(b, p, size));
+   return result;
+}
+
+static nir_def *
+dzn_raw_reduce(nir_builder *b, nir_def *previous, nir_def *value, nir_def *weight,
+                nir_def *reduction, nir_def *initialized)
+{
+   nir_def *minmax = nir_bcsel(b, nir_ieq_imm(b, reduction, 2), nir_fmin(b, previous, value), nir_fmax(b, previous, value));
+   minmax = nir_bcsel(b, initialized, minmax, value);
+   return nir_bcsel(b, nir_uge(b, reduction, nir_imm_int(b, 2)), minmax,
+      nir_fadd(b, previous, nir_fmul(b, value, weight)));
+}
+
+static nir_def *
+dzn_raw_filtered_level(nir_builder *b, const struct dzn_raw_texture_state *t,
+                        const struct dzn_raw_sampler_state *s, nir_def *coords, nir_def *layer,
+                        nir_def *level, nir_def *linear, nir_def *offset, nir_def *reduction)
+{
+   nir_def *layout, *shape;
+   dzn_raw_texture_mip(b, t, level, &layout, &shape);
+   nir_def *size = nir_vec2(b, nir_channel(b, layout, 3), nir_channel(b, shape, 0));
+   nir_def *scaled = nir_bcsel(b, nir_ine_imm(b, s->unnormalized, 0), coords, nir_fmul(b, coords, nir_u2f32(b, size)));
+   nir_def *position = nir_fsub(b, scaled, nir_bcsel(b, linear, nir_imm_float(b, .5), nir_imm_float(b, 0)));
+   nir_def *base = nir_iadd(b, nir_f2i32(b, nir_ffloor(b, position)), offset);
+   nir_def *fraction = nir_bcsel(b, linear, nir_ffract(b, position), nir_imm_zero(b, 2, 32));
+   nir_variable *sum = nir_local_variable_create(nir_shader_get_entrypoint(b->shader), glsl_vec4_type(), "filtered");
+   nir_variable *initialized = nir_local_variable_create(nir_shader_get_entrypoint(b->shader), glsl_bool_type(), "filtered_valid");
+   nir_store_var(b, sum, nir_imm_zero(b, 4, 32), 15);
+   nir_store_var(b, initialized, nir_imm_false(b), 1);
+   for (unsigned i = 0; i < 4; i++) {
+      unsigned ix = i & 1, iy = i >> 1;
+      nir_def *wx = ix ? nir_channel(b, fraction, 0) : nir_fsub(b, nir_imm_float(b, 1), nir_channel(b, fraction, 0));
+      nir_def *wy = iy ? nir_channel(b, fraction, 1) : nir_fsub(b, nir_imm_float(b, 1), nir_channel(b, fraction, 1));
+      nir_def *weight = nir_fmul(b, wx, wy);
+      nir_push_if(b, nir_flt(b, nir_imm_float(b, 0), weight));
+      nir_def *valid_x, *valid_y;
+      nir_def *x = dzn_raw_address(b, nir_iadd_imm(b, nir_channel(b, base, 0), ix), nir_channel(b, size, 0), s->u, &valid_x);
+      nir_def *y = dzn_raw_address(b, nir_iadd_imm(b, nir_channel(b, base, 1), iy), nir_channel(b, size, 1), s->v, &valid_y);
+      nir_push_if(b, nir_iand(b, valid_x, valid_y));
+      nir_def *value = dzn_raw_texture_fetch(b, t, level, x, y, layer);
+      nir_push_else(b, NULL);
+      nir_def *border = dzn_raw_texture_mapping(b, t, s->border);
+      nir_pop_if(b, NULL);
+      value = nir_if_phi(b, value, border);
+      nir_store_var(b, sum, dzn_raw_reduce(b, nir_load_var(b, sum), value, weight, reduction, nir_load_var(b, initialized)), 15);
+      nir_store_var(b, initialized, nir_imm_true(b), 1);
+      nir_pop_if(b, NULL);
+   }
+   return nir_load_var(b, sum);
+}
+
+static nir_def *
+dzn_raw_filtered(nir_builder *b, const struct dzn_raw_texture_state *t,
+                  const struct dzn_raw_sampler_state *s, nir_def *coords, nir_def *layer,
+                  nir_def *lod, nir_def *offset)
+{
+   nir_def *sampler_lod = nir_fmax(b, nir_fmin(b, lod, s->max_lod), s->min_lod);
+   nir_def *linear = nir_ine_imm(b, nir_iand(b, s->filter,
+      nir_bcsel(b, nir_fge(b, nir_imm_float(b, 0), sampler_lod), nir_imm_int(b, 4), nir_imm_int(b, 16))), 0);
+   nir_def *clamped = nir_fmax(b, sampler_lod, t->min_lod);
+   clamped = nir_fmax(b, nir_fmin(b, clamped, nir_u2f32(b, nir_iadd_imm(b, t->levels, -1))), nir_imm_float(b, 0));
+   nir_def *mip_linear = nir_ine_imm(b, nir_iand_imm(b, s->filter, 1), 0);
+   nir_def *level = nir_f2u32(b, nir_ffloor(b, nir_fadd(b, clamped,
+      nir_bcsel(b, mip_linear, nir_imm_float(b, 0), nir_imm_float(b, .5)))));
+   nir_def *fraction = nir_bcsel(b, mip_linear, nir_ffract(b, clamped), nir_imm_float(b, 0));
+   nir_def *reduction = nir_iand_imm(b, nir_ushr_imm(b, s->filter, 7), 3);
+   nir_def *first = dzn_raw_filtered_level(b, t, s, coords, layer, level, linear, offset, reduction);
+   nir_push_if(b, nir_flt(b, nir_imm_float(b, 0), fraction));
+   nir_def *next = nir_umin(b, nir_iadd_imm(b, level, 1), nir_iadd_imm(b, t->levels, -1));
+   nir_def *second = dzn_raw_filtered_level(b, t, s, coords, layer, next, linear, offset, reduction);
+   nir_def *combined = dzn_raw_reduce(b, nir_fmul(b, first, nir_fsub(b, nir_imm_float(b, 1), fraction)),
+      second, fraction, reduction, nir_imm_true(b));
+   combined = nir_bcsel(b, nir_uge(b, reduction, nir_imm_int(b, 2)),
+      nir_bcsel(b, nir_ieq_imm(b, reduction, 2), nir_fmin(b, first, second), nir_fmax(b, first, second)), combined);
+   nir_push_else(b, NULL);
+   nir_pop_if(b, NULL);
+   return nir_if_phi(b, combined, first);
+}
+
+static bool
+dzn_nir_raw_texture_instr(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   if (tex->sampler_dim != GLSL_SAMPLER_DIM_2D || tex->is_shadow || tex->is_sparse ||
+       tex->def.bit_size != 32 || (tex->op != nir_texop_txs && tex->op != nir_texop_query_levels &&
+       nir_alu_type_get_base_type(tex->dest_type) != nir_type_float))
+      return false;
+   if (tex->op != nir_texop_txf && tex->op != nir_texop_txs && tex->op != nir_texop_query_levels &&
+       tex->op != nir_texop_tex && tex->op != nir_texop_txb && tex->op != nir_texop_txl &&
+       tex->op != nir_texop_txd && tex->op != nir_texop_lod && tex->op != nir_texop_tg4)
+      return false;
+   int texture_src = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   int sampler_src = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
+   if (texture_src < 0)
+      return false;
+   bool sampling = tex->op != nir_texop_txf && tex->op != nir_texop_txs && tex->op != nir_texop_query_levels;
+   if (sampling && sampler_src < 0)
+      return false;
+   nir_deref_instr *texture = nir_src_as_deref(tex->src[texture_src].src);
+   const struct dzn_pipeline_layout *layout = data;
+   b->cursor = nir_before_instr(instr);
+   struct dzn_raw_texture_state t = {.metadata = dzn_nir_image_metadata_descriptor(b)};
+   nir_def *index = dzn_nir_image_metadata_index(b, texture, layout);
+   t.base = nir_iadd_imm(b, nir_imul_imm(b, index, sizeof(struct dzn_raw_image_metadata)),
+      layout->image_metadata_offset * sizeof(uint32_t));
+   t.code = dzn_raw_metadata_load(b, &t, offsetof(struct dzn_raw_image_metadata, format), 1);
+   t.levels = dzn_raw_metadata_load(b, &t, offsetof(struct dzn_raw_image_metadata, mip_count), 1);
+   t.mapping = dzn_raw_metadata_load(b, &t, offsetof(struct dzn_raw_image_metadata, mapping), 1);
+   t.min_lod = dzn_raw_metadata_load(b, &t, offsetof(struct dzn_raw_image_metadata, min_lod), 1);
+   int coord_src = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   int lod_src = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+   int offset_src = nir_tex_instr_src_index(tex, nir_tex_src_offset);
+   nir_def *coord = coord_src >= 0 ? tex->src[coord_src].src.ssa : nir_imm_zero(b, 2, 32);
+   nir_def *xy = nir_trim_vector(b, coord, 2);
+   int projector = nir_tex_instr_src_index(tex, nir_tex_src_projector);
+   if (projector >= 0)
+      xy = nir_fdiv(b, xy, tex->src[projector].src.ssa);
+   nir_def *dx = nir_imm_zero(b, 2, 32), *dy = dx;
+   if (sampling && tex->op != nir_texop_txl && tex->op != nir_texop_tg4) {
+      int ddx = nir_tex_instr_src_index(tex, nir_tex_src_ddx);
+      int ddy = nir_tex_instr_src_index(tex, nir_tex_src_ddy);
+      if (ddx >= 0 && ddy >= 0) {
+         dx = nir_trim_vector(b, tex->src[ddx].src.ssa, 2);
+         dy = nir_trim_vector(b, tex->src[ddy].src.ssa, 2);
+      } else if (b->shader->info.stage == MESA_SHADER_FRAGMENT) {
+         dx = nir_ddx(b, xy);
+         dy = nir_ddy(b, xy);
+      }
+   }
+   nir_push_if(b, nir_ine_imm(b, t.code, 0));
+   t.buffer = dzn_nir_raw_buffer(b, texture, false);
+   nir_def *result = NULL;
+   nir_def *level = lod_src >= 0 ? tex->src[lod_src].src.ssa : nir_imm_int(b, 0);
+   nir_def *offset = offset_src >= 0 ? tex->src[offset_src].src.ssa : nir_imm_ivec2(b, 0, 0);
+   nir_def *layer = tex->is_array && coord_src >= 0 ? nir_channel(b, coord, 2) : nir_imm_int(b, 0);
+   if (tex->op == nir_texop_query_levels) {
+      result = t.levels;
+   } else if (tex->op == nir_texop_txs) {
+      nir_def *mip, *shape;
+      dzn_raw_texture_mip(b, &t, level, &mip, &shape);
+      result = nir_vec3(b, nir_channel(b, mip, 3), nir_channel(b, shape, 0), nir_channel(b, shape, 1));
+   } else if (tex->op == nir_texop_txf) {
+      xy = nir_iadd(b, xy, offset);
+      result = dzn_raw_texture_fetch(b, &t, level, nir_channel(b, xy, 0), nir_channel(b, xy, 1), layer);
+   } else {
+      nir_deref_instr *sampler = nir_src_as_deref(tex->src[sampler_src].src);
+      struct dzn_raw_texture_state sm = t;
+      sm.base = nir_iadd_imm(b, nir_imul_imm(b, dzn_nir_image_metadata_index(b, sampler, layout),
+         sizeof(struct dzn_raw_image_metadata)), layout->image_metadata_offset * sizeof(uint32_t) +
+         offsetof(struct dzn_raw_image_metadata, sampler));
+      nir_def *address = dzn_raw_metadata_load(b, &sm, 0, 4);
+      nir_def *properties = dzn_raw_metadata_load(b, &sm, 16, 3);
+      nir_def *lods = dzn_raw_metadata_load(b, &sm, 28, 3);
+      struct dzn_raw_sampler_state sam = {.filter = nir_channel(b, address, 0),
+         .u = nir_channel(b, address, 1), .v = nir_channel(b, address, 2),
+         .unnormalized = nir_channel(b, properties, 0), .anisotropy = nir_channel(b, properties, 2),
+         .bias = nir_channel(b, lods, 0), .min_lod = nir_channel(b, lods, 1), .max_lod = nir_channel(b, lods, 2),
+         .border = dzn_raw_metadata_load(b, &sm, 40, 4)};
+      if (tex->is_array) {
+         nir_def *mip, *shape;
+         dzn_raw_texture_mip(b, &t, nir_imm_int(b, 0), &mip, &shape);
+         layer = nir_umin(b, nir_iadd_imm(b, nir_channel(b, shape, 1), -1),
+            nir_f2u32(b, nir_fmax(b, nir_ffloor(b, nir_fadd_imm(b, layer, .5)), nir_imm_float(b, 0))));
+      }
+      if (tex->op == nir_texop_tg4) {
+         nir_def *mip, *shape;
+         dzn_raw_texture_mip(b, &t, nir_imm_int(b, 0), &mip, &shape);
+         nir_def *size = nir_vec2(b, nir_channel(b, mip, 3), nir_channel(b, shape, 0));
+         nir_def *scaled = nir_bcsel(b, nir_ine_imm(b, sam.unnormalized, 0), xy, nir_fmul(b, xy, nir_u2f32(b, size)));
+         nir_def *base = nir_f2i32(b, nir_ffloor(b, nir_fadd_imm(b, scaled, -.5)));
+         nir_def *components[4];
+         for (unsigned c = 0; c < 4; c++) {
+            nir_def *p = nir_iadd(b, base, offset);
+            p = nir_iadd(b, p, nir_imm_ivec2(b, tex->tg4_offsets[c][0], tex->tg4_offsets[c][1]));
+            nir_def *vx, *vy;
+            nir_def *x = dzn_raw_address(b, nir_channel(b, p, 0), nir_channel(b, size, 0), sam.u, &vx);
+            nir_def *y = dzn_raw_address(b, nir_channel(b, p, 1), nir_channel(b, size, 1), sam.v, &vy);
+            nir_push_if(b, nir_iand(b, vx, vy));
+            nir_def *v = dzn_raw_texture_fetch(b, &t, nir_imm_int(b, 0), x, y, layer);
+            nir_push_else(b, NULL);
+            nir_def *border = dzn_raw_texture_mapping(b, &t, sam.border);
+            nir_pop_if(b, NULL);
+            components[c] = nir_channel(b, nir_if_phi(b, v, border), tex->component);
+         }
+         result = nir_vec(b, components, 4);
+      } else {
+         nir_def *mip, *shape;
+         dzn_raw_texture_mip(b, &t, nir_imm_int(b, 0), &mip, &shape);
+         nir_def *size = nir_u2f32(b, nir_vec2(b, nir_channel(b, mip, 3), nir_channel(b, shape, 0)));
+         nir_def *gx = nir_fmul(b, dx, size), *gy = nir_fmul(b, dy, size);
+         nir_def *lx = nir_fsqrt(b, nir_fdot(b, gx, gx)), *ly = nir_fsqrt(b, nir_fdot(b, gy, gy));
+         nir_def *major = nir_fmax(b, lx, ly), *minor = nir_fmin(b, lx, ly);
+         nir_def *anisotropic = nir_ine_imm(b, nir_iand_imm(b, sam.filter, 64), 0);
+         nir_def *aniso = nir_bcsel(b, anisotropic, nir_u2f32(b, nir_umax(b, sam.anisotropy, nir_imm_int(b, 1))), nir_imm_float(b, 1));
+         nir_def *footprint = nir_fmax(b, minor, nir_fdiv(b, major, aniso));
+         nir_def *taps = nir_f2u32(b, nir_fceil(b, nir_fmin(b, aniso,
+            nir_fmax(b, nir_fdiv(b, major, nir_fmax(b, footprint, nir_imm_float(b, 1))), nir_imm_float(b, 1)))));
+         if (tex->op == nir_texop_txl) {
+            major = minor = nir_imm_float(b, 1);
+            taps = nir_imm_int(b, 1);
+         }
+         nir_def *lod = tex->op == nir_texop_txl ? level : nir_flog2(b, nir_fmax(b, footprint, nir_imm_float(b, 5.421010862427522e-20f)));
+         nir_def *bias_value = sam.bias;
+         if (tex->op == nir_texop_txb) {
+            int bias = nir_tex_instr_src_index(tex, nir_tex_src_bias);
+            if (bias >= 0)
+               bias_value = nir_fadd(b, bias_value, tex->src[bias].src.ssa);
+         }
+         bias_value = nir_fmax(b, nir_fmin(b, bias_value, nir_imm_float(b, D3D12_MIP_LOD_BIAS_MAX)),
+            nir_imm_float(b, -D3D12_MIP_LOD_BIAS_MAX));
+         lod = nir_fadd(b, lod, bias_value);
+         int min_lod = nir_tex_instr_src_index(tex, nir_tex_src_min_lod);
+         if (min_lod >= 0)
+            sam.min_lod = nir_fmax(b, sam.min_lod, tex->src[min_lod].src.ssa);
+         if (tex->op == nir_texop_lod) {
+            nir_def *clamped = nir_fmax(b, nir_fmax(b, nir_fmin(b, lod, sam.max_lod), sam.min_lod), t.min_lod);
+            clamped = nir_fmax(b, nir_fmin(b, clamped, nir_u2f32(b, nir_iadd_imm(b, t.levels, -1))), nir_imm_float(b, 0));
+            clamped = nir_bcsel(b, nir_ieq_imm(b, nir_iand_imm(b, sam.filter, 1), 0),
+               nir_ffloor(b, nir_fadd_imm(b, clamped, .5)), clamped);
+            result = nir_vec2(b, clamped, lod);
+         } else {
+            nir_def *direction = nir_bcsel(b, nir_fge(b, lx, ly), dx, dy);
+            nir_variable *sum = nir_local_variable_create(nir_shader_get_entrypoint(b->shader), glsl_vec4_type(), "anisotropic");
+            nir_variable *cursor = nir_local_variable_create(nir_shader_get_entrypoint(b->shader), glsl_uint_type(), "tap");
+            nir_store_var(b, sum, nir_imm_zero(b, 4, 32), 15);
+            nir_store_var(b, cursor, nir_imm_int(b, 0), 1);
+            nir_def *count = nir_u2f32(b, taps);
+            nir_def *reduction = nir_iand_imm(b, nir_ushr_imm(b, sam.filter, 7), 3);
+            nir_push_loop(b);
+            nir_def *i = nir_load_var(b, cursor);
+            nir_break_if(b, nir_uge(b, i, taps));
+            nir_def *position = nir_fadd_imm(b, nir_fdiv(b, nir_fadd_imm(b, nir_u2f32(b, i), .5), count), -.5);
+            nir_def *value = dzn_raw_filtered(b, &t, &sam, nir_fadd(b, xy, nir_fmul(b, direction, position)), layer, lod, offset);
+            nir_store_var(b, sum, dzn_raw_reduce(b, nir_load_var(b, sum), value, nir_frcp(b, count), reduction, nir_ine_imm(b, i, 0)), 15);
+            nir_store_var(b, cursor, nir_iadd_imm(b, i, 1), 1);
+            nir_pop_loop(b, NULL);
+            result = nir_load_var(b, sum);
+         }
+      }
+   }
+   result = nir_trim_vector(b, result, tex->def.num_components);
+   nir_push_else(b, NULL);
+   nir_tex_instr *native = nir_instr_as_tex(nir_instr_clone(b->shader, instr));
+   nir_builder_instr_insert(b, &native->instr);
+   nir_pop_if(b, NULL);
+   result = nir_if_phi(b, result, &native->def);
+   nir_def_rewrite_uses(&tex->def, result);
+   nir_instr_remove(instr);
+   return true;
+}
+
+bool
+dzn_nir_lower_raw_textures(nir_shader *nir, const struct dzn_pipeline_layout *layout)
+{
+   return nir_shader_instructions_pass(nir, dzn_nir_raw_texture_instr, nir_metadata_none, (void *)layout);
+}
+
+struct dzn_unformatted_image_state {
+   const struct dzn_pipeline_layout *layout;
+   bool integer_images;
+};
+
+static bool
+dzn_nir_unformatted_image_load(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_image_deref_load)
+      return false;
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   nir_variable *var = nir_deref_instr_get_variable(deref);
+   if (var->data.image.format != PIPE_FORMAT_NONE)
+      return false;
+   const struct dzn_unformatted_image_state *state = data;
+   const struct dzn_pipeline_layout *layout = state->layout;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *mask = dzn_nir_image_metadata(b, deref, layout);
+   nir_def *loaded = &intr->def;
+   bool converted = state->integer_images && nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr)) == nir_type_float &&
+                    glsl_get_sampler_dim(glsl_without_array(var->type)) != GLSL_SAMPLER_DIM_BUF;
+   if (converted) {
+      nir_def *conversion = nir_iand_imm(b, nir_ushr_imm(b, mask, 8), 7);
+      nir_push_if(b, nir_ine_imm(b, conversion, 0));
+      nir_deref_instr *integer = dzn_nir_integer_image_deref(b, deref);
+      nir_intrinsic_instr *raw = nir_instr_as_intrinsic(nir_instr_clone(b->shader, &intr->instr));
+      nir_intrinsic_set_dest_type(raw, nir_type_uint32);
+      nir_intrinsic_set_format(raw, PIPE_FORMAT_R32G32B32A32_UINT);
+      nir_intrinsic_set_access(raw, nir_intrinsic_access(raw) | ACCESS_COHERENT);
+      nir_builder_instr_insert(b, &raw->instr);
+      nir_src_rewrite(&raw->src[0], &integer->def);
+      nir_def *snorm = nir_fmax(b,
+         nir_fmul_imm(b, nir_i2f32(b, nir_ishr_imm(b, nir_ishl_imm(b, &raw->def, 24), 24)), 1.0 / 127.0),
+         nir_imm_float(b, -1));
+      nir_def *unorm = nir_fmul_imm(b, nir_u2f32(b, &raw->def), 1.0 / 65535.0);
+      nir_def *unorm8 = nir_fmul_imm(b, nir_u2f32(b, &raw->def), 1.0 / 255.0);
+      nir_def *half = nir_unpack_half_x_dxil(b, &raw->def);
+      nir_def *value = nir_bcsel(b, nir_ieq_imm(b, conversion, 1), snorm, unorm);
+      value = nir_bcsel(b, nir_ieq_imm(b, conversion, 3), unorm8, value);
+      value = nir_bcsel(b, nir_ieq_imm(b, conversion, 4), half, value);
+      value = nir_bcsel(b, nir_ieq_imm(b, conversion, 5), &raw->def, value);
+      nir_push_else(b, NULL);
+      nir_intrinsic_instr *native = nir_instr_as_intrinsic(nir_instr_clone(b->shader, &intr->instr));
+      nir_builder_instr_insert(b, &native->instr);
+      nir_pop_if(b, NULL);
+      loaded = nir_if_phi(b, value, &native->def);
+   } else {
+      b->cursor = nir_after_instr(&intr->instr);
+   }
+   nir_def *defaults = dzn_nir_image_defaults(b, deref, intr->def.num_components,
+      nir_intrinsic_dest_type(intr), intr->def.bit_size, layout);
+   nir_def *components[4];
+   for (unsigned c = 0; c < intr->def.num_components; c++)
+      components[c] = nir_bcsel(b, nir_ine_imm(b, nir_iand_imm(b, mask, BITFIELD_BIT(c + 4)), 0),
+         nir_channel(b, loaded, c), nir_channel(b, defaults, c));
+   nir_def *result = nir_vec(b, components, intr->def.num_components);
+   if (converted) {
+      nir_def_rewrite_uses(&intr->def, result);
+      nir_instr_remove(&intr->instr);
+   } else {
+      nir_def_rewrite_uses_after(&intr->def, result);
+   }
+   return true;
+}
+
+bool
+dzn_nir_lower_unformatted_image_loads(nir_shader *nir, const struct dzn_pipeline_layout *layout, bool integer_images)
+{
+   struct dzn_unformatted_image_state state = {layout, integer_images};
+   return nir_shader_intrinsics_pass(nir, dzn_nir_unformatted_image_load, nir_metadata_none, &state);
 }
 
 static void dzn_nir_predicate_image(nir_builder *b, nir_instr *instr, nir_def *valid,
@@ -1718,4 +2525,209 @@ bool dzn_nir_lower_robust_images(nir_shader *nir, const struct dzn_pipeline_layo
    struct dzn_robust_image_state state = {layout, images, buffers};
    return nir_shader_instructions_pass(nir, dzn_nir_robust_image_instruction, nir_metadata_none,
                                        &state);
+}
+
+static nir_def *dzn_nir_amd_pixel_inv_w(nir_builder *b, bool sample_rate)
+{
+   nir_def *inv_w = nir_channel(b, nir_load_frag_coord(b), 3);
+   if (sample_rate) {
+      nir_def *offset =
+          nir_fadd_imm(b, nir_load_sample_pos_from_id(b, 32, nir_load_sample_id(b)), -0.5f);
+      inv_w = nir_fsub(b, inv_w,
+                       nir_fadd(b, nir_fmul(b, nir_ddx_fine(b, inv_w), nir_channel(b, offset, 0)),
+                                nir_fmul(b, nir_ddy_fine(b, inv_w), nir_channel(b, offset, 1))));
+   }
+   return inv_w;
+}
+
+static nir_def *dzn_nir_amd_barycentric(nir_builder *b, enum glsl_interp_mode mode, bool centroid,
+                                        bool sample_rate)
+{
+   nir_def *sample =
+       centroid ? nir_imax(b, nir_find_lsb(b, nir_load_sample_mask_in(b)), nir_imm_int(b, 0))
+                : nir_load_sample_id(b);
+   nir_def *offset = nir_fadd_imm(b, nir_load_sample_pos_from_id(b, 32, sample), -0.5f);
+   nir_def *coord = nir_load_barycentric_coord_pixel(b, 32, .interp_mode = mode);
+   if (mode == INTERP_MODE_SMOOTH)
+      coord = nir_fmul(b, coord, dzn_nir_amd_pixel_inv_w(b, sample_rate));
+   coord = nir_fadd(b, coord,
+                    nir_fadd(b, nir_fmul(b, nir_ddx_fine(b, coord), nir_channel(b, offset, 0)),
+                             nir_fmul(b, nir_ddy_fine(b, coord), nir_channel(b, offset, 1))));
+   if (mode == INTERP_MODE_SMOOTH)
+      coord = nir_fdiv(b, coord,
+                       nir_fadd(b, nir_fadd(b, nir_channel(b, coord, 0), nir_channel(b, coord, 1)),
+                                nir_channel(b, coord, 2)));
+   return coord;
+}
+
+static nir_def *dzn_nir_barycentric_offset(nir_builder *b, enum glsl_interp_mode mode,
+                                           nir_def *offset, bool sample_rate)
+{
+   nir_cursor cursor = b->cursor;
+   b->cursor = nir_before_cf_list(&nir_shader_get_entrypoint(b->shader)->body);
+   nir_def *coord = nir_load_barycentric_coord_pixel(b, 32, .interp_mode = mode);
+   if (mode == INTERP_MODE_SMOOTH)
+      coord = nir_fmul(b, coord, dzn_nir_amd_pixel_inv_w(b, sample_rate));
+   nir_def *dx = nir_ddx_fine(b, coord);
+   nir_def *dy = nir_ddy_fine(b, coord);
+   b->cursor = cursor;
+   coord = nir_fadd(b, coord,
+                    nir_fadd(b, nir_fmul(b, dx, nir_channel(b, offset, 0)),
+                             nir_fmul(b, dy, nir_channel(b, offset, 1))));
+   if (mode == INTERP_MODE_SMOOTH)
+      coord = nir_fdiv(b, coord,
+                       nir_fadd(b, nir_fadd(b, nir_channel(b, coord, 0), nir_channel(b, coord, 1)),
+                                nir_channel(b, coord, 2)));
+   return coord;
+}
+
+static bool dzn_nir_lower_barycentric(nir_builder *b, nir_intrinsic_instr *intr,
+                                               void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_deref &&
+       intr->intrinsic != nir_intrinsic_interp_deref_at_centroid &&
+       intr->intrinsic != nir_intrinsic_interp_deref_at_sample &&
+       intr->intrinsic != nir_intrinsic_interp_deref_at_offset)
+      return false;
+   nir_variable *var = nir_deref_instr_get_variable(nir_src_as_deref(intr->src[0]));
+   if (!var || var->data.mode != nir_var_system_value)
+      return false;
+   const bool sample_rate = *(const bool *)data;
+   unsigned location = var->data.location;
+   enum glsl_interp_mode mode;
+   if (location == SYSTEM_VALUE_BARYCENTRIC_LINEAR_COORD ||
+       location == SYSTEM_VALUE_BARYCENTRIC_PERSP_COORD) {
+      mode = location == SYSTEM_VALUE_BARYCENTRIC_LINEAR_COORD ? INTERP_MODE_NOPERSPECTIVE :
+                                                               INTERP_MODE_SMOOTH;
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_def *offset = NULL;
+      if (intr->intrinsic == nir_intrinsic_interp_deref_at_offset) {
+         offset = intr->src[1].ssa;
+      } else if (intr->intrinsic == nir_intrinsic_interp_deref_at_sample ||
+                 (intr->intrinsic == nir_intrinsic_load_deref && var->data.sample)) {
+         nir_def *sample = intr->intrinsic == nir_intrinsic_interp_deref_at_sample ?
+            intr->src[1].ssa : nir_load_sample_id(b);
+         offset = nir_fadd_imm(b, nir_load_sample_pos_from_id(b, 32, sample), -0.5f);
+      } else if (intr->intrinsic == nir_intrinsic_interp_deref_at_centroid || var->data.centroid) {
+         nir_def *sample = nir_imax(b, nir_find_lsb(b, nir_load_sample_mask_in(b)), nir_imm_int(b, 0));
+         offset = nir_fadd_imm(b, nir_load_sample_pos_from_id(b, 32, sample), -0.5f);
+      }
+      nir_def *coord = offset ? dzn_nir_barycentric_offset(b, mode, offset, sample_rate) :
+         nir_load_barycentric_coord_pixel(b, 32, .interp_mode = mode);
+      nir_def_rewrite_uses(&intr->def, coord);
+      nir_instr_remove(&intr->instr);
+      return true;
+   }
+   if (intr->intrinsic != nir_intrinsic_load_deref)
+      return false;
+   switch (location) {
+   case SYSTEM_VALUE_BARYCENTRIC_LINEAR_PIXEL:
+   case SYSTEM_VALUE_BARYCENTRIC_LINEAR_CENTROID:
+   case SYSTEM_VALUE_BARYCENTRIC_LINEAR_SAMPLE:
+      mode = INTERP_MODE_NOPERSPECTIVE;
+      break;
+   case SYSTEM_VALUE_BARYCENTRIC_PERSP_PIXEL:
+   case SYSTEM_VALUE_BARYCENTRIC_PERSP_CENTROID:
+   case SYSTEM_VALUE_BARYCENTRIC_PERSP_SAMPLE:
+   case SYSTEM_VALUE_BARYCENTRIC_PULL_MODEL:
+      mode = INTERP_MODE_SMOOTH;
+      break;
+   default:
+      return false;
+   }
+   b->cursor = nir_before_cf_list(&nir_shader_get_entrypoint(b->shader)->body);
+   nir_def *coord;
+   if (location == SYSTEM_VALUE_BARYCENTRIC_LINEAR_CENTROID ||
+       location == SYSTEM_VALUE_BARYCENTRIC_PERSP_CENTROID)
+      coord = dzn_nir_amd_barycentric(b, mode, true, sample_rate);
+   else if (location == SYSTEM_VALUE_BARYCENTRIC_LINEAR_SAMPLE ||
+            location == SYSTEM_VALUE_BARYCENTRIC_PERSP_SAMPLE)
+      coord = dzn_nir_amd_barycentric(b, mode, false, sample_rate);
+   else
+      coord = nir_load_barycentric_coord_pixel(b, 32, .interp_mode = mode);
+   nir_def *result = nir_channels(b, coord, 6);
+   if (location == SYSTEM_VALUE_BARYCENTRIC_PULL_MODEL) {
+      nir_def *inv_w = dzn_nir_amd_pixel_inv_w(b, sample_rate);
+      result = nir_vec3(b, inv_w, nir_fmul(b, nir_channel(b, coord, 1), inv_w),
+                        nir_fmul(b, nir_channel(b, coord, 2), inv_w));
+   }
+   nir_def_rewrite_uses(&intr->def, result);
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
+bool dzn_nir_lower_barycentrics(nir_shader *nir, bool sample_rate)
+{
+   sample_rate |= nir->info.stage == MESA_SHADER_FRAGMENT && nir->info.fs.uses_sample_shading;
+   nir_foreach_variable_with_modes(var, nir, nir_var_shader_in | nir_var_system_value)
+   {
+      sample_rate |=
+          var->data.sample || (var->data.mode == nir_var_system_value &&
+                               (var->data.location == SYSTEM_VALUE_BARYCENTRIC_LINEAR_SAMPLE ||
+                                var->data.location == SYSTEM_VALUE_BARYCENTRIC_PERSP_SAMPLE ||
+                                var->data.location == SYSTEM_VALUE_SAMPLE_ID ||
+                                var->data.location == SYSTEM_VALUE_SAMPLE_POS));
+   }
+   return nir_shader_intrinsics_pass(nir, dzn_nir_lower_barycentric,
+                                     nir_metadata_control_flow, &sample_rate);
+}
+
+static const struct glsl_type *dzn_image_lod_type(const struct glsl_type *type)
+{
+   if (glsl_type_is_array(type))
+      return glsl_array_type(dzn_image_lod_type(glsl_get_array_element(type)),
+                             glsl_get_length(type), 0);
+   return glsl_array_type(type, DZN_IMAGE_MIP_DESCRIPTORS, 0);
+}
+
+static bool dzn_nir_lower_image_lod_intrinsic(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_image_deref_load:
+   case nir_intrinsic_image_deref_store:
+   case nir_intrinsic_image_deref_size:
+   case nir_intrinsic_image_deref_samples:
+   case nir_intrinsic_image_deref_atomic:
+   case nir_intrinsic_image_deref_atomic_swap:
+      break;
+   default:
+      return false;
+   }
+   nir_variable *var = nir_deref_instr_get_variable(nir_src_as_deref(intr->src[0]));
+   if (glsl_get_sampler_dim(glsl_without_array(var->type)) == GLSL_SAMPLER_DIM_BUF)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   int lod_src = intr->intrinsic == nir_intrinsic_image_deref_load    ? 3
+                 : intr->intrinsic == nir_intrinsic_image_deref_store ? 4
+                 : intr->intrinsic == nir_intrinsic_image_deref_size  ? 1
+                                                                      : -1;
+   nir_def *lod = lod_src >= 0 ? intr->src[lod_src].ssa : nir_imm_int(b, 0);
+   if (lod_src >= 0 && !nir_src_is_const(intr->src[lod_src]))
+      nir_intrinsic_set_access(intr, nir_intrinsic_access(intr) | ACCESS_NON_UNIFORM);
+   nir_deref_path path;
+   nir_deref_path_init(&path, nir_src_as_deref(intr->src[0]), NULL);
+   nir_deref_instr *deref = nir_build_deref_var(b, path.path[0]->var);
+   for (unsigned i = 1; path.path[i]; i++)
+      deref = nir_build_deref_array(b, deref, path.path[i]->arr.index.ssa);
+   nir_deref_path_finish(&path);
+   deref = nir_build_deref_array(b, deref,
+                                 nir_umin(b, lod, nir_imm_int(b, DZN_IMAGE_MIP_DESCRIPTORS - 1)));
+   nir_src_rewrite(&intr->src[0], &deref->def);
+   if (lod_src >= 0)
+      nir_src_rewrite(&intr->src[lod_src], nir_imm_int(b, 0));
+   return true;
+}
+
+bool dzn_nir_lower_image_lod(nir_shader *nir)
+{
+   nir_foreach_variable_with_modes(var, nir, nir_var_image | nir_var_uniform)
+   {
+      if (glsl_type_is_image(glsl_without_array(var->type)) &&
+          glsl_get_sampler_dim(glsl_without_array(var->type)) != GLSL_SAMPLER_DIM_BUF)
+         var->type = dzn_image_lod_type(var->type);
+   }
+   bool progress = nir_shader_intrinsics_pass(nir, dzn_nir_lower_image_lod_intrinsic,
+                                              nir_metadata_control_flow, NULL);
+   nir_remove_dead_derefs(nir);
+   return progress;
 }
